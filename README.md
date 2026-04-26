@@ -23,11 +23,50 @@ Provides three Drupal services that wrap DKAN's metastore, datastore, and search
 
 ## Installation
 
-Add as a Composer path repo or VCS dependency, then enable:
+1. Add as a Composer dependency. Use either a VCS repository (recommended for shared sites) or a local path repo (for development inside this monorepo):
 
-```bash
-drush en dkan_query_tools
-```
+   **VCS:**
+   ```json
+   {
+     "repositories": {
+       "dkan_query_tools": {
+         "type": "vcs",
+         "url": "https://github.com/dcgoodwin2112/dkan_query_tools.git"
+       }
+     },
+     "require": {
+       "dcgoodwin2112/dkan_query_tools": "dev-main"
+     }
+   }
+   ```
+
+   **Path repo:**
+   ```json
+   {
+     "repositories": {
+       "dkan_query_tools_local": {
+         "type": "path",
+         "url": "./web/modules/custom/dkan_query_tools",
+         "options": { "symlink": true }
+       }
+     },
+     "require": {
+       "dcgoodwin2112/dkan_query_tools": "@dev"
+     }
+   }
+   ```
+
+2. Resolve and install:
+
+   ```bash
+   composer update dcgoodwin2112/dkan_query_tools
+   ```
+
+3. Enable the module:
+
+   ```bash
+   drush en dkan_query_tools
+   ```
 
 The three services become available immediately:
 
