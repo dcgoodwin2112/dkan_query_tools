@@ -1,0 +1,8 @@
+name: DKAN Query Tools
+description: Shared DKAN catalog and datastore query tools for AI agents and other consumers.
+type: module
+core_version_requirement: ^10.2 || ^11
+package: DKAN
+dependencies:
+  - dkan:metastore
+  - dkan:datastore

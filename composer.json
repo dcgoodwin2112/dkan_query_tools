@@ -1,0 +1,27 @@
+{
+  "name": "dcgoodwin2112/dkan_query_tools",
+  "description": "Shared DKAN catalog and datastore query tools for AI agents and other consumers.",
+  "type": "drupal-custom-module",
+  "license": "GPL-2.0-or-later",
+  "require": {},
+  "require-dev": {
+    "drupal/core": "^10.2 || ^11",
+    "phpunit/phpunit": "^9 || ^10",
+    "getdkan/mock-chain": "^1"
+  },
+  "autoload": {
+    "psr-4": {
+      "Drupal\\dkan_query_tools\\": "src/"
+    }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "Drupal\\Tests\\dkan_query_tools\\": "tests/src/"
+    }
+  },
+  "config": {
+    "allow-plugins": {
+      "drupal/core-composer-scaffold": false
+    }
+  }
+}

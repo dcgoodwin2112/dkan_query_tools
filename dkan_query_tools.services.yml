@@ -1,0 +1,26 @@
+services:
+  dkan_query_tools.logger_channel:
+    parent: logger.channel_base
+    arguments: ['dkan_query_tools']
+
+  dkan_query_tools.metastore:
+    class: Drupal\dkan_query_tools\Tool\MetastoreTools
+    arguments:
+      - '@dkan.metastore.service'
+      - '@dkan.common.dataset_info'
+
+  dkan_query_tools.datastore:
+    class: Drupal\dkan_query_tools\Tool\DatastoreTools
+    arguments:
+      - '@dkan.datastore.service'
+      - '@dkan.datastore.query'
+      - '@dkan.metastore.service'
+      - '@dkan.common.dataset_info'
+      - '@database'
+      - '@dkan_query_tools.logger_channel'
+
+  dkan_query_tools.search:
+    class: Drupal\dkan_query_tools\Tool\SearchTools
+    arguments:
+      - '@http_client'
+      - '@request_stack'
