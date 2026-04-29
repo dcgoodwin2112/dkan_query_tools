@@ -11,6 +11,10 @@ interface StatementInterface extends \IteratorAggregate {
 
   public function fetchAssoc(): array|false;
 
+  public function fetchAll(?int $mode = NULL): array;
+
+  public function fetchCol(int $index = 0): array;
+
   public function getIterator(): \ArrayIterator;
 
 }

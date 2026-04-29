@@ -1030,6 +1030,210 @@ class DatastoreToolsTest extends TestCase {
     return $this->createTools(datastore: $datastore, database: $database);
   }
 
+  public function testSampleRowsReturnsRowsAndStripsRecordNumber(): void {
+    $storage = $this->createMock(DatabaseTableInterface::class);
+    $storage->method('getTableName')->willReturn('datastore_test');
+    $datastore = $this->createMock(DatastoreService::class);
+    $datastore->method('getStorage')->willReturn($storage);
+
+    $rows = [
+      ['record_number' => 1, 'state' => 'CA', 'value' => '10'],
+      ['record_number' => 2, 'state' => 'TX', 'value' => '20'],
+    ];
+
+    $statement = $this->createMock(StatementInterface::class);
+    $statement->method('fetchAll')->willReturn($rows);
+
+    $select = $this->createMock(SelectInterface::class);
+    $select->method('fields')->willReturnSelf();
+    $select->method('orderBy')->willReturnSelf();
+    $select->method('range')->willReturnSelf();
+    $select->method('execute')->willReturn($statement);
+
+    $database = $this->createMock(Connection::class);
+    $database->method('select')->willReturn($select);
+
+    $tools = $this->createTools(datastore: $datastore, database: $database);
+    $result = $tools->sampleRows('abc__1', 2);
+
+    $this->assertEquals('abc__1', $result['resource_id']);
+    $this->assertEquals(2, $result['row_count']);
+    $this->assertCount(2, $result['rows']);
+    $this->assertArrayNotHasKey('record_number', $result['rows'][0]);
+    $this->assertEquals('CA', $result['rows'][0]['state']);
+  }
+
+  public function testSampleRowsClampsN(): void {
+    $storage = $this->createMock(DatabaseTableInterface::class);
+    $storage->method('getTableName')->willReturn('datastore_test');
+    $datastore = $this->createMock(DatastoreService::class);
+    $datastore->method('getStorage')->willReturn($storage);
+
+    $statement = $this->createMock(StatementInterface::class);
+    $statement->method('fetchAll')->willReturn([]);
+
+    $rangeArgs = [];
+    $select = $this->createMock(SelectInterface::class);
+    $select->method('fields')->willReturnSelf();
+    $select->method('orderBy')->willReturnSelf();
+    $select->method('range')->willReturnCallback(function ($start, $length) use (&$rangeArgs, $select) {
+      $rangeArgs = [$start, $length];
+      return $select;
+    });
+    $select->method('execute')->willReturn($statement);
+
+    $database = $this->createMock(Connection::class);
+    $database->method('select')->willReturn($select);
+
+    $tools = $this->createTools(datastore: $datastore, database: $database);
+
+    // Below floor — clamps to 1.
+    $tools->sampleRows('abc__1', 0);
+    $this->assertEquals([0, 1], $rangeArgs);
+
+    // Above ceiling — clamps to 50.
+    $tools->sampleRows('abc__1', 9999);
+    $this->assertEquals([0, 50], $rangeArgs);
+  }
+
+  public function testSampleRowsErrorOnUnknownResource(): void {
+    $datastore = $this->createMock(DatastoreService::class);
+    $datastore->method('getStorage')->willThrowException(new \Exception('No such resource'));
+    $tools = $this->createTools(datastore: $datastore);
+    $result = $tools->sampleRows('bad__id');
+    $this->assertArrayHasKey('error', $result);
+    $this->assertStringContainsString('No such resource', $result['error']);
+  }
+
+  public function testDistinctValuesReturnsValuesAndDetectsTruncation(): void {
+    $storage = $this->createMock(DatabaseTableInterface::class);
+    $storage->method('getSchema')->willReturn([
+      'fields' => [
+        'record_number' => ['type' => 'serial'],
+        'state' => ['type' => 'text'],
+      ],
+    ]);
+    $storage->method('getTableName')->willReturn('datastore_test');
+    $datastore = $this->createMock(DatastoreService::class);
+    $datastore->method('getStorage')->willReturn($storage);
+
+    // Limit 3, return 4 (limit+1) to trigger truncation.
+    $statement = $this->createMock(StatementInterface::class);
+    $statement->method('fetchCol')->willReturn(['AL', 'CA', 'NY', 'TX']);
+
+    $select = $this->createMock(SelectInterface::class);
+    $select->method('addField')->willReturnSelf();
+    $select->method('distinct')->willReturnSelf();
+    $select->method('orderBy')->willReturnSelf();
+    $select->method('range')->willReturnSelf();
+    $select->method('execute')->willReturn($statement);
+
+    $database = $this->createMock(Connection::class);
+    $database->method('select')->willReturn($select);
+
+    $tools = $this->createTools(datastore: $datastore, database: $database);
+    $result = $tools->distinctValues('abc__1', 'state', 3);
+
+    $this->assertEquals('state', $result['column']);
+    $this->assertEquals(['AL', 'CA', 'NY'], $result['values']);
+    $this->assertEquals(3, $result['value_count']);
+    $this->assertTrue($result['truncated']);
+  }
+
+  public function testDistinctValuesNotTruncatedWhenWithinLimit(): void {
+    $storage = $this->createMock(DatabaseTableInterface::class);
+    $storage->method('getSchema')->willReturn([
+      'fields' => [
+        'record_number' => ['type' => 'serial'],
+        'state' => ['type' => 'text'],
+      ],
+    ]);
+    $storage->method('getTableName')->willReturn('datastore_test');
+    $datastore = $this->createMock(DatastoreService::class);
+    $datastore->method('getStorage')->willReturn($storage);
+
+    $statement = $this->createMock(StatementInterface::class);
+    $statement->method('fetchCol')->willReturn(['AL', 'CA']);
+
+    $select = $this->createMock(SelectInterface::class);
+    $select->method('addField')->willReturnSelf();
+    $select->method('distinct')->willReturnSelf();
+    $select->method('orderBy')->willReturnSelf();
+    $select->method('range')->willReturnSelf();
+    $select->method('execute')->willReturn($statement);
+
+    $database = $this->createMock(Connection::class);
+    $database->method('select')->willReturn($select);
+
+    $tools = $this->createTools(datastore: $datastore, database: $database);
+    $result = $tools->distinctValues('abc__1', 'state', 50);
+
+    $this->assertFalse($result['truncated']);
+    $this->assertEquals(2, $result['value_count']);
+  }
+
+  public function testDistinctValuesUnknownColumn(): void {
+    $storage = $this->createMock(DatabaseTableInterface::class);
+    $storage->method('getSchema')->willReturn([
+      'fields' => [
+        'record_number' => ['type' => 'serial'],
+        'state' => ['type' => 'text'],
+      ],
+    ]);
+    $datastore = $this->createMock(DatastoreService::class);
+    $datastore->method('getStorage')->willReturn($storage);
+
+    $tools = $this->createTools(datastore: $datastore);
+    $result = $tools->distinctValues('abc__1', 'nonexistent');
+    $this->assertArrayHasKey('error', $result);
+    $this->assertStringContainsString('Unknown column', $result['error']);
+  }
+
+  public function testDistinctValuesRejectsRecordNumber(): void {
+    $storage = $this->createMock(DatabaseTableInterface::class);
+    $storage->method('getSchema')->willReturn([
+      'fields' => ['record_number' => ['type' => 'serial']],
+    ]);
+    $datastore = $this->createMock(DatastoreService::class);
+    $datastore->method('getStorage')->willReturn($storage);
+
+    $tools = $this->createTools(datastore: $datastore);
+    $result = $tools->distinctValues('abc__1', 'record_number');
+    $this->assertArrayHasKey('error', $result);
+  }
+
+  public function testDistinctValuesFiltersNulls(): void {
+    $storage = $this->createMock(DatabaseTableInterface::class);
+    $storage->method('getSchema')->willReturn([
+      'fields' => [
+        'record_number' => ['type' => 'serial'],
+        'state' => ['type' => 'text'],
+      ],
+    ]);
+    $storage->method('getTableName')->willReturn('datastore_test');
+    $datastore = $this->createMock(DatastoreService::class);
+    $datastore->method('getStorage')->willReturn($storage);
+
+    $statement = $this->createMock(StatementInterface::class);
+    $statement->method('fetchCol')->willReturn([NULL, 'CA', '', 'TX']);
+
+    $select = $this->createMock(SelectInterface::class);
+    $select->method('addField')->willReturnSelf();
+    $select->method('distinct')->willReturnSelf();
+    $select->method('orderBy')->willReturnSelf();
+    $select->method('range')->willReturnSelf();
+    $select->method('execute')->willReturn($statement);
+
+    $database = $this->createMock(Connection::class);
+    $database->method('select')->willReturn($select);
+
+    $tools = $this->createTools(datastore: $datastore, database: $database);
+    $result = $tools->distinctValues('abc__1', 'state');
+
+    // NULL filtered out, empty string kept.
+    $this->assertEquals(['CA', '', 'TX'], $result['values']);
+  }
+
   public function testGetDatastoreStatsAllColumns(): void {
     $tools = $this->createStatsTools(
       [

@@ -129,6 +129,115 @@ class DatastoreTools {
   }
 
   /**
+   * Return the first N rows of a datastore resource in stable order.
+   *
+   * Useful for orienting an LLM agent to actual cell shapes, code values, and
+   * units before it composes filters or aggregations. Sorted by record_number
+   * ascending so repeated calls return the same rows.
+   *
+   * @param string $resourceId
+   *   Resource id in identifier__version form.
+   * @param int $n
+   *   Number of rows to return. Clamped to [1, 50].
+   *
+   * @return array
+   *   ['resource_id', 'rows', 'row_count'] or ['error' => message].
+   */
+  public function sampleRows(string $resourceId, int $n = 5): array {
+    $n = min(max($n, 1), 50);
+    try {
+      [$identifier, $version] = $this->parseResourceId($resourceId);
+      $storage = $this->datastoreService->getStorage($identifier, $version);
+      $tableName = $storage->getTableName();
+      $rows = $this->database->select($tableName, 't')
+        ->fields('t')
+        ->orderBy('record_number', 'ASC')
+        ->range(0, $n)
+        ->execute()
+        ->fetchAll(\PDO::FETCH_ASSOC);
+
+      // Strip record_number from each row — it's a synthetic column.
+      $rows = array_map(static function (array $row): array {
+        unset($row['record_number']);
+        return $row;
+      }, $rows);
+
+      return [
+        'resource_id' => $resourceId,
+        'rows' => $rows,
+        'row_count' => count($rows),
+      ];
+    }
+    catch (\Throwable $e) {
+      $this->logger->error('MCP: Sample rows failed for @id: @error', [
+        '@id' => $resourceId,
+        '@error' => $e->getMessage(),
+      ]);
+      return ['error' => $e->getMessage()];
+    }
+  }
+
+  /**
+   * Return distinct values of a column for a datastore resource.
+   *
+   * Helps an LLM agent learn the code list / enum domain of a column before
+   * filtering. Returns at most $limit values; sets truncated=true when more
+   * exist.
+   *
+   * @param string $resourceId
+   *   Resource id in identifier__version form.
+   * @param string $column
+   *   Column name to enumerate.
+   * @param int $limit
+   *   Maximum values to return. Clamped to [1, 500].
+   *
+   * @return array
+   *   ['resource_id', 'column', 'values', 'value_count', 'truncated'] or
+   *   ['error' => message].
+   */
+  public function distinctValues(string $resourceId, string $column, int $limit = 50): array {
+    $limit = min(max($limit, 1), 500);
+    try {
+      [$identifier, $version] = $this->parseResourceId($resourceId);
+      $storage = $this->datastoreService->getStorage($identifier, $version);
+      $schema = $storage->getSchema();
+      if (!isset($schema['fields'][$column]) || $column === 'record_number') {
+        return ['error' => "Unknown column '{$column}' for resource '{$resourceId}'"];
+      }
+      $tableName = $storage->getTableName();
+
+      // Fetch limit+1 to detect truncation.
+      $query = $this->database->select($tableName, 't');
+      $query->addField('t', $column, 'value');
+      $query->distinct();
+      $query->orderBy('value', 'ASC');
+      $query->range(0, $limit + 1);
+      $rows = $query->execute()->fetchCol();
+
+      $truncated = count($rows) > $limit;
+      $values = array_slice($rows, 0, $limit);
+      // Drop NULLs but keep empty strings (they are real distinct values).
+      $values = array_values(array_filter($values, static fn($v) => $v !== NULL));
+
+      return [
+        'resource_id' => $resourceId,
+        'column' => $column,
+        'values' => $values,
+        'value_count' => count($values),
+        'truncated' => $truncated,
+      ];
+    }
+    catch (\Throwable $e) {
+      $this->logger->error('MCP: Distinct values failed for @id.@col: @error', [
+        '@id' => $resourceId,
+        '@col' => $column,
+        '@error' => $e->getMessage(),
+      ]);
+      return ['error' => $e->getMessage()];
+    }
+  }
+
+  /**
    * Get the schema (column names and types) for a datastore resource.
    */
   public function getDatastoreSchema(string $resourceId): array {

@@ -29,4 +29,6 @@ interface SelectInterface {
 
   public function groupBy(string $field): SelectInterface;
 
+  public function distinct(bool $distinct = TRUE): SelectInterface;
+
 }
