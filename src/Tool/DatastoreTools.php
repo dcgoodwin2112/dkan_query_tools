@@ -17,6 +17,25 @@ class DatastoreTools {
 
   protected const MAX_DATASETS = 200;
 
+  /**
+   * Per-instance memo of resourceId → dictionary lookup result.
+   *
+   * Values: array with [identifier, url, fields] on a hit; FALSE for a
+   * looked-up-but-no-link miss. Avoids walking the dataset list twice in a
+   * single tool call sequence.
+   */
+  protected array $dictionaryCache = [];
+
+  /**
+   * Service-level toggle for dictionary enrichment.
+   *
+   * Defaults to TRUE (production). Used by the eval harness to compare
+   * with-vs-without the enrichment without a code revert. Per-call
+   * `$includeDictionary` still wins when FALSE; this flag only matters when
+   * the per-call flag is TRUE.
+   */
+  protected bool $dictionaryEnrichmentEnabled = TRUE;
+
   public function __construct(
     protected DatastoreService $datastoreService,
     protected Query $queryService,
@@ -25,6 +44,20 @@ class DatastoreTools {
     protected Connection $database,
     protected LoggerInterface $logger,
   ) {}
+
+  /**
+   * Toggle dictionary enrichment for the lifetime of this service instance.
+   *
+   * Intended for the eval harness — production callers should leave this at
+   * its TRUE default. Pass FALSE to make `getDatastoreSchema()` skip the
+   * lookup even when callers don't pass `includeDictionary: false`.
+   */
+  public function setDictionaryEnrichmentEnabled(bool $enabled): void {
+    $this->dictionaryEnrichmentEnabled = $enabled;
+    if (!$enabled) {
+      $this->dictionaryCache = [];
+    }
+  }
 
   /**
    * Query a datastore resource with filters, sorting, pagination, and aggregation.
@@ -240,12 +273,28 @@ class DatastoreTools {
 
   /**
    * Get the schema (column names and types) for a datastore resource.
+   *
+   * When the linked distribution carries a `describedBy` data dictionary,
+   * each column is enriched with `dictionary_title`, `dictionary_description`,
+   * and `dictionary_type` (the publisher-declared type, distinct from the
+   * DB-derived `type`). The response root gains `dictionary_identifier` and
+   * `dictionary_url` when a dictionary is resolved.
+   *
+   * @param string $resourceId
+   *   Resource id in identifier__version form.
+   * @param bool $includeDictionary
+   *   When FALSE, skip the dictionary lookup (test/perf opt-out).
    */
-  public function getDatastoreSchema(string $resourceId): array {
+  public function getDatastoreSchema(string $resourceId, bool $includeDictionary = TRUE): array {
     try {
       [$identifier, $version] = $this->parseResourceId($resourceId);
       $storage = $this->datastoreService->getStorage($identifier, $version);
       $schema = $storage->getSchema();
+
+      $dictionary = ($includeDictionary && $this->dictionaryEnrichmentEnabled)
+        ? $this->findDictionaryFor($resourceId)
+        : NULL;
+      $fieldsByName = $dictionary['fields'] ?? [];
 
       $columns = [];
       if (isset($schema['fields'])) {
@@ -260,15 +309,165 @@ class DatastoreTools {
           if (!empty($definition['description'])) {
             $col['description'] = $definition['description'];
           }
+          if (isset($fieldsByName[$name])) {
+            $field = $fieldsByName[$name];
+            if (!empty($field['title'])) {
+              $col['dictionary_title'] = $field['title'];
+            }
+            if (!empty($field['description'])) {
+              $col['dictionary_description'] = $field['description'];
+            }
+            if (!empty($field['type'])) {
+              $col['dictionary_type'] = $field['type'];
+            }
+          }
           $columns[] = $col;
         }
       }
 
-      return ['resource_id' => $resourceId, 'columns' => $columns];
+      $result = ['resource_id' => $resourceId, 'columns' => $columns];
+      if ($dictionary) {
+        $result['dictionary_identifier'] = $dictionary['identifier'];
+        $result['dictionary_url'] = $dictionary['url'];
+      }
+      return $result;
     }
     catch (\Exception $e) {
       return ['error' => $e->getMessage()];
     }
+  }
+
+  /**
+   * Locate the data dictionary linked to a resource via its distribution.
+   *
+   * Walks the dataset list, matches a distribution's %Ref:downloadURL against
+   * the parsed resource_id, reads the inline `describedBy` URL, extracts the
+   * dictionary identifier from the URL's last path segment, and fetches the
+   * dictionary item from the metastore.
+   *
+   * Best-effort: any failure (no link, bad URL, fetch error) returns NULL so
+   * schema enrichment never breaks the primary call. Per-instance memoized.
+   *
+   * Known limitation: only finds dictionaries linked on inline distributions
+   * (the DCAT-flat shape DKAN currently stores). Dictionaries linked via
+   * standalone `distribution` metastore items would require a separate walk.
+   *
+   * @return array|null
+   *   ['identifier' => string, 'url' => string, 'fields' => [name => array]]
+   *   or NULL when no dictionary is linked or lookup failed.
+   */
+  protected function findDictionaryFor(string $resourceId): ?array {
+    if (array_key_exists($resourceId, $this->dictionaryCache)) {
+      return $this->dictionaryCache[$resourceId] ?: NULL;
+    }
+    $this->dictionaryCache[$resourceId] = FALSE;
+
+    [$wantId, $wantVersion] = $this->parseResourceId($resourceId);
+    if (!$wantId || !$wantVersion) {
+      return NULL;
+    }
+
+    try {
+      $datasets = $this->metastore->getAll('dataset', 0, self::MAX_DATASETS);
+    }
+    catch (\Throwable $e) {
+      $this->logger->debug('Dictionary lookup: dataset list fetch failed for @id: @msg', [
+        '@id' => $resourceId,
+        '@msg' => $e->getMessage(),
+      ]);
+      return NULL;
+    }
+
+    $describedBy = NULL;
+    $matchedDistribution = FALSE;
+    foreach ($datasets as $dataset) {
+      $data = json_decode((string) $dataset);
+      if (!isset($data->distribution) || !is_array($data->distribution)) {
+        continue;
+      }
+      foreach ($data->distribution as $dist) {
+        $ref = $dist->{'%Ref:downloadURL'}[0]->data ?? NULL;
+        if (!$ref || ($ref->identifier ?? NULL) !== $wantId || ($ref->version ?? NULL) !== $wantVersion) {
+          continue;
+        }
+        $matchedDistribution = TRUE;
+        if (!empty($dist->describedBy)) {
+          $describedBy = (string) $dist->describedBy;
+        }
+        break 2;
+      }
+    }
+    if ($describedBy === NULL) {
+      // Cap-hit warning: walk exhausted without finding the resource. If the
+      // catalog has more than MAX_DATASETS entries, the linked distribution
+      // may exist on a dataset we never inspected.
+      if (!$matchedDistribution && count($datasets) >= self::MAX_DATASETS) {
+        $this->logger->warning('Dictionary lookup hit dataset cap (@cap) without matching resource @id; consider raising the cap or adding a reverse-lookup index.', [
+          '@cap' => self::MAX_DATASETS,
+          '@id' => $resourceId,
+        ]);
+      }
+      return NULL;
+    }
+
+    $dictId = $this->extractDictionaryIdentifier($describedBy);
+    if ($dictId === NULL) {
+      $this->logger->debug('Dictionary lookup: malformed describedBy URL for @id: @url', [
+        '@id' => $resourceId,
+        '@url' => $describedBy,
+      ]);
+      return NULL;
+    }
+
+    try {
+      $doc = $this->metastore->get('data-dictionary', $dictId);
+    }
+    catch (\Throwable $e) {
+      $this->logger->debug('Dictionary lookup: failed to fetch dictionary @dict for @id: @msg', [
+        '@dict' => $dictId,
+        '@id' => $resourceId,
+        '@msg' => $e->getMessage(),
+      ]);
+      return NULL;
+    }
+
+    $decoded = json_decode((string) $doc, TRUE);
+    $rawFields = $decoded['data']['fields'] ?? [];
+    if (!is_array($rawFields)) {
+      return NULL;
+    }
+    $fieldsByName = [];
+    foreach ($rawFields as $field) {
+      if (!empty($field['name'])) {
+        $fieldsByName[$field['name']] = $field;
+      }
+    }
+
+    $payload = [
+      'identifier' => $dictId,
+      'url' => $describedBy,
+      'fields' => $fieldsByName,
+    ];
+    $this->dictionaryCache[$resourceId] = $payload;
+    return $payload;
+  }
+
+  /**
+   * Extract the dictionary identifier from a `describedBy` URL.
+   *
+   * Expected shape:
+   *   .../api/1/metastore/schemas/data-dictionary/items/<identifier>
+   *
+   * Returns the trailing path segment, or NULL if the URL is malformed.
+   */
+  protected function extractDictionaryIdentifier(string $url): ?string {
+    $path = parse_url($url, PHP_URL_PATH);
+    if (!$path) {
+      return NULL;
+    }
+    $segments = array_values(array_filter(explode('/', $path), static fn($s) => $s !== ''));
+    $id = end($segments);
+    return $id !== FALSE && $id !== '' ? $id : NULL;
   }
 
   /**

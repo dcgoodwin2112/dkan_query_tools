@@ -230,6 +230,215 @@ class DatastoreToolsTest extends TestCase {
     $this->assertArrayHasKey('error', $result);
   }
 
+  /**
+   * Helpers: build fixtures for dictionary-enrichment tests.
+   */
+  protected function buildDatasetWithDistribution(string $resId, string $version, ?string $describedBy): RootedJsonData {
+    $dist = [
+      '%Ref:downloadURL' => [['data' => ['identifier' => $resId, 'version' => $version]]],
+      'title' => 'Sample',
+    ];
+    if ($describedBy !== NULL) {
+      $dist['describedBy'] = $describedBy;
+      $dist['describedByType'] = 'application/vnd.tableschema+json';
+    }
+    return new RootedJsonData(json_encode([
+      'identifier' => 'dataset-' . $resId,
+      'distribution' => [$dist],
+    ]));
+  }
+
+  protected function buildDictionary(string $id, array $fields): RootedJsonData {
+    return new RootedJsonData(json_encode([
+      'identifier' => $id,
+      'data' => [
+        'title' => 'Test Dictionary',
+        'fields' => $fields,
+      ],
+    ]));
+  }
+
+  protected function buildDatastoreMockWithFields(array $fields): DatastoreService {
+    $storage = $this->createMock(DatabaseTableInterface::class);
+    $storage->method('getSchema')->willReturn(['fields' => $fields]);
+    $datastore = $this->createMock(DatastoreService::class);
+    $datastore->method('getStorage')->willReturn($storage);
+    return $datastore;
+  }
+
+  public function testGetDatastoreSchemaWithDictionary(): void {
+    $resId = 'abc123';
+    $version = 'v1';
+    $url = 'https://site.example/api/1/metastore/schemas/data-dictionary/items/dict-uuid';
+
+    $metastore = $this->createMock(MetastoreService::class);
+    $metastore->method('getAll')->with('dataset', 0, 200)->willReturn([
+      $this->buildDatasetWithDistribution($resId, $version, $url),
+    ]);
+    $metastore->method('get')->with('data-dictionary', 'dict-uuid')->willReturn(
+      $this->buildDictionary('dict-uuid', [
+        ['name' => 'name', 'type' => 'string', 'title' => 'Full Name', 'description' => "Person's full name"],
+        ['name' => 'age', 'type' => 'integer'],
+      ]),
+    );
+
+    $datastore = $this->buildDatastoreMockWithFields([
+      'record_number' => ['type' => 'serial'],
+      'name' => ['type' => 'varchar'],
+      'age' => ['type' => 'int'],
+    ]);
+
+    $tools = $this->createTools(datastore: $datastore, metastore: $metastore);
+    $result = $tools->getDatastoreSchema($resId . '__' . $version);
+
+    $this->assertSame('dict-uuid', $result['dictionary_identifier']);
+    $this->assertSame($url, $result['dictionary_url']);
+    $this->assertCount(2, $result['columns']);
+    $name = $result['columns'][0];
+    $this->assertSame('name', $name['name']);
+    $this->assertSame('Full Name', $name['dictionary_title']);
+    $this->assertSame("Person's full name", $name['dictionary_description']);
+    $this->assertSame('string', $name['dictionary_type']);
+    // DB-derived type stays untouched.
+    $this->assertSame('varchar', $name['type']);
+    $age = $result['columns'][1];
+    $this->assertSame('age', $age['name']);
+    $this->assertSame('integer', $age['dictionary_type']);
+    $this->assertArrayNotHasKey('dictionary_title', $age);
+    $this->assertArrayNotHasKey('dictionary_description', $age);
+  }
+
+  public function testGetDatastoreSchemaNoDictionary(): void {
+    $metastore = $this->createMock(MetastoreService::class);
+    $metastore->method('getAll')->willReturn([
+      $this->buildDatasetWithDistribution('abc', 'v1', NULL),
+    ]);
+    // get() must not be called when no describedBy is found.
+    $metastore->expects($this->never())->method('get');
+
+    $datastore = $this->buildDatastoreMockWithFields([
+      'name' => ['type' => 'varchar'],
+    ]);
+
+    $tools = $this->createTools(datastore: $datastore, metastore: $metastore);
+    $result = $tools->getDatastoreSchema('abc__v1');
+
+    $this->assertArrayNotHasKey('dictionary_identifier', $result);
+    $this->assertArrayNotHasKey('dictionary_url', $result);
+    $this->assertSame('name', $result['columns'][0]['name']);
+    $this->assertArrayNotHasKey('dictionary_title', $result['columns'][0]);
+  }
+
+  public function testGetDatastoreSchemaDictionaryMissingField(): void {
+    $url = 'https://site.example/api/1/metastore/schemas/data-dictionary/items/dict-uuid';
+    $metastore = $this->createMock(MetastoreService::class);
+    $metastore->method('getAll')->willReturn([
+      $this->buildDatasetWithDistribution('abc', 'v1', $url),
+    ]);
+    // Dictionary documents 'name' but not 'unmapped'.
+    $metastore->method('get')->willReturn(
+      $this->buildDictionary('dict-uuid', [
+        ['name' => 'name', 'type' => 'string', 'title' => 'Full Name'],
+      ]),
+    );
+
+    $datastore = $this->buildDatastoreMockWithFields([
+      'name' => ['type' => 'varchar'],
+      'unmapped' => ['type' => 'int'],
+    ]);
+
+    $tools = $this->createTools(datastore: $datastore, metastore: $metastore);
+    $result = $tools->getDatastoreSchema('abc__v1');
+
+    $this->assertSame('Full Name', $result['columns'][0]['dictionary_title']);
+    $this->assertSame('unmapped', $result['columns'][1]['name']);
+    $this->assertArrayNotHasKey('dictionary_title', $result['columns'][1]);
+    $this->assertArrayNotHasKey('dictionary_type', $result['columns'][1]);
+  }
+
+  public function testGetDatastoreSchemaDictionaryFetchFails(): void {
+    $url = 'https://site.example/api/1/metastore/schemas/data-dictionary/items/dict-uuid';
+    $metastore = $this->createMock(MetastoreService::class);
+    $metastore->method('getAll')->willReturn([
+      $this->buildDatasetWithDistribution('abc', 'v1', $url),
+    ]);
+    $metastore->method('get')->willThrowException(new \Exception('Dictionary item not found'));
+
+    $datastore = $this->buildDatastoreMockWithFields([
+      'name' => ['type' => 'varchar'],
+    ]);
+
+    $tools = $this->createTools(datastore: $datastore, metastore: $metastore);
+    $result = $tools->getDatastoreSchema('abc__v1');
+
+    // Degrades silently to today's shape.
+    $this->assertArrayNotHasKey('dictionary_identifier', $result);
+    $this->assertArrayNotHasKey('dictionary_title', $result['columns'][0]);
+    $this->assertSame('name', $result['columns'][0]['name']);
+    $this->assertArrayNotHasKey('error', $result);
+  }
+
+  public function testGetDatastoreSchemaServiceFlagDisablesEnrichment(): void {
+    $metastore = $this->createMock(MetastoreService::class);
+    // Flag off → no metastore lookup at all.
+    $metastore->expects($this->never())->method('getAll');
+    $metastore->expects($this->never())->method('get');
+
+    $datastore = $this->buildDatastoreMockWithFields([
+      'name' => ['type' => 'varchar'],
+    ]);
+
+    $tools = $this->createTools(datastore: $datastore, metastore: $metastore);
+    $tools->setDictionaryEnrichmentEnabled(FALSE);
+    $result = $tools->getDatastoreSchema('abc__v1');
+
+    $this->assertArrayNotHasKey('dictionary_identifier', $result);
+    $this->assertArrayNotHasKey('dictionary_title', $result['columns'][0]);
+  }
+
+  public function testGetDatastoreSchemaServiceFlagReEnablement(): void {
+    $url = 'https://site.example/api/1/metastore/schemas/data-dictionary/items/dict-uuid';
+    $metastore = $this->createMock(MetastoreService::class);
+    $metastore->method('getAll')->willReturn([
+      $this->buildDatasetWithDistribution('abc', 'v1', $url),
+    ]);
+    $metastore->method('get')->willReturn(
+      $this->buildDictionary('dict-uuid', [
+        ['name' => 'name', 'type' => 'string', 'title' => 'Name'],
+      ]),
+    );
+
+    $datastore = $this->buildDatastoreMockWithFields([
+      'name' => ['type' => 'varchar'],
+    ]);
+
+    $tools = $this->createTools(datastore: $datastore, metastore: $metastore);
+    $tools->setDictionaryEnrichmentEnabled(FALSE);
+    $tools->setDictionaryEnrichmentEnabled(TRUE);
+    $result = $tools->getDatastoreSchema('abc__v1');
+
+    // Re-enabled: dictionary fields appear, cache cleared on disable.
+    $this->assertSame('dict-uuid', $result['dictionary_identifier']);
+    $this->assertSame('Name', $result['columns'][0]['dictionary_title']);
+  }
+
+  public function testGetDatastoreSchemaIncludeDictionaryFalse(): void {
+    $metastore = $this->createMock(MetastoreService::class);
+    // Neither getAll nor get may be called when opt-out is set.
+    $metastore->expects($this->never())->method('getAll');
+    $metastore->expects($this->never())->method('get');
+
+    $datastore = $this->buildDatastoreMockWithFields([
+      'name' => ['type' => 'varchar'],
+    ]);
+
+    $tools = $this->createTools(datastore: $datastore, metastore: $metastore);
+    $result = $tools->getDatastoreSchema('abc__v1', includeDictionary: FALSE);
+
+    $this->assertArrayNotHasKey('dictionary_identifier', $result);
+    $this->assertSame('name', $result['columns'][0]['name']);
+  }
+
   public function testQueryDatastoreInvalidConditions(): void {
     $tools = $this->createTools();
     $result = $tools->queryDatastore('test-resource', conditions: 'not valid json');

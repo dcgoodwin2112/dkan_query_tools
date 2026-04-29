@@ -128,6 +128,144 @@ class MetastoreToolsTest extends TestCase {
     $this->assertEquals('text/csv', $result['distributions'][0]['mediaType']);
   }
 
+  public function testListDistributionsExposesDescribedBy(): void {
+    $url = 'https://site.example/api/1/metastore/schemas/data-dictionary/items/dict-1';
+    $data = [
+      'identifier' => 'abc-123',
+      'distribution' => [
+        [
+          'title' => 'CSV File',
+          'mediaType' => 'text/csv',
+          'downloadURL' => 'http://example.com/data.csv',
+          'describedBy' => $url,
+          'describedByType' => 'application/vnd.tableschema+json',
+        ],
+      ],
+      '%Ref:distribution' => [['identifier' => 'dist-1']],
+    ];
+    $metastore = $this->createMock(MetastoreService::class);
+    $metastore->method('get')->willReturn(new RootedJsonData(json_encode($data)));
+
+    $tools = $this->createTools($metastore);
+    $result = $tools->listDistributions('abc-123');
+
+    $this->assertSame($url, $result['distributions'][0]['describedBy']);
+    $this->assertSame('application/vnd.tableschema+json', $result['distributions'][0]['describedByType']);
+  }
+
+  public function testListDistributionsOmitsDescribedByWhenAbsent(): void {
+    $data = [
+      'identifier' => 'abc-123',
+      'distribution' => [['title' => 'CSV', 'mediaType' => 'text/csv', 'downloadURL' => 'http://x']],
+      '%Ref:distribution' => [['identifier' => 'dist-1']],
+    ];
+    $metastore = $this->createMock(MetastoreService::class);
+    $metastore->method('get')->willReturn(new RootedJsonData(json_encode($data)));
+
+    $tools = $this->createTools($metastore);
+    $result = $tools->listDistributions('abc-123');
+
+    $this->assertArrayNotHasKey('describedBy', $result['distributions'][0]);
+    $this->assertArrayNotHasKey('describedByType', $result['distributions'][0]);
+  }
+
+  public function testGetDataDictionaryByDatasetUuid(): void {
+    $url = 'https://site.example/api/1/metastore/schemas/data-dictionary/items/dict-1';
+    $dataset = [
+      'identifier' => 'abc-123',
+      'distribution' => [
+        [
+          '%Ref:downloadURL' => [['data' => ['identifier' => 'res-1', 'version' => 'v1']]],
+          'describedBy' => $url,
+        ],
+      ],
+    ];
+    $dictionary = [
+      'identifier' => 'dict-1',
+      'data' => [
+        'title' => 'My Dictionary',
+        'fields' => [['name' => 'col_a', 'type' => 'string', 'title' => 'Col A']],
+      ],
+    ];
+
+    $metastore = $this->createMock(MetastoreService::class);
+    $metastore->method('get')->willReturnCallback(function ($schema, $id) use ($dataset, $dictionary) {
+      if ($schema === 'dataset' && $id === 'abc-123') {
+        return new RootedJsonData(json_encode($dataset));
+      }
+      if ($schema === 'data-dictionary' && $id === 'dict-1') {
+        return new RootedJsonData(json_encode($dictionary));
+      }
+      throw new \Exception('not found');
+    });
+
+    $tools = $this->createTools($metastore);
+    $result = $tools->getDataDictionary('abc-123');
+
+    $this->assertArrayHasKey('dictionaries', $result);
+    $key = 'res-1__v1';
+    $this->assertArrayHasKey($key, $result['dictionaries']);
+    $entry = $result['dictionaries'][$key];
+    $this->assertSame('dict-1', $entry['identifier']);
+    $this->assertSame($url, $entry['url']);
+    $this->assertSame('My Dictionary', $entry['title']);
+    $this->assertCount(1, $entry['fields']);
+    $this->assertSame('col_a', $entry['fields'][0]['name']);
+  }
+
+  public function testGetDataDictionaryByResourceId(): void {
+    $url = 'https://site.example/api/1/metastore/schemas/data-dictionary/items/dict-2';
+    $datasetList = [
+      new RootedJsonData(json_encode([
+        'distribution' => [
+          [
+            '%Ref:downloadURL' => [['data' => ['identifier' => 'res-1', 'version' => 'v1']]],
+            'describedBy' => $url,
+          ],
+        ],
+      ])),
+    ];
+    $metastore = $this->createMock(MetastoreService::class);
+    $metastore->method('getAll')->with('dataset', 0, 200)->willReturn($datasetList);
+    $metastore->method('get')->with('data-dictionary', 'dict-2')->willReturn(
+      new RootedJsonData(json_encode([
+        'identifier' => 'dict-2',
+        'data' => ['title' => 'D2', 'fields' => [['name' => 'x', 'type' => 'integer']]],
+      ])),
+    );
+
+    $tools = $this->createTools($metastore);
+    $result = $tools->getDataDictionary('res-1__v1');
+
+    $this->assertArrayHasKey('res-1__v1', $result['dictionaries']);
+    $this->assertSame('dict-2', $result['dictionaries']['res-1__v1']['identifier']);
+  }
+
+  public function testGetDataDictionaryNotLinked(): void {
+    $dataset = [
+      'identifier' => 'abc-123',
+      'distribution' => [['title' => 'CSV']],
+    ];
+    $metastore = $this->createMock(MetastoreService::class);
+    $metastore->method('get')->willReturn(new RootedJsonData(json_encode($dataset)));
+
+    $tools = $this->createTools($metastore);
+    $result = $tools->getDataDictionary('abc-123');
+
+    $this->assertArrayHasKey('error', $result);
+  }
+
+  public function testGetDataDictionaryByResourceIdNoMatch(): void {
+    $metastore = $this->createMock(MetastoreService::class);
+    $metastore->method('getAll')->willReturn([]);
+
+    $tools = $this->createTools($metastore);
+    $result = $tools->getDataDictionary('missing__v1');
+
+    $this->assertArrayHasKey('error', $result);
+    $this->assertStringContainsString('No distribution', $result['error']);
+  }
+
   public function testGetDistribution(): void {
     // Real DKAN structure: %Ref:downloadURL is nested inside 'data'.
     $data = [
