@@ -87,6 +87,113 @@ class DatastoreToolsTest extends TestCase {
     $result = $tools->queryDatastore('nonexistent');
     $this->assertArrayHasKey('error', $result);
     $this->assertStringContainsString('Resource not found', $result['error']);
+    $this->assertSame('nonexistent', $result['resource_id']);
+  }
+
+  public function testQueryDatastoreUnknownColumnMysqlError(): void {
+    $storage = $this->createMock(DatabaseTableInterface::class);
+    $storage->method('getSchema')->willReturn([
+      'fields' => [
+        'record_number' => ['type' => 'serial'],
+        'state' => ['type' => 'varchar'],
+        'rate' => ['type' => 'decimal'],
+      ],
+    ]);
+    $datastore = $this->createMock(DatastoreService::class);
+    $datastore->method('getStorage')->willReturn($storage);
+    $queryService = $this->createMock(Query::class);
+    $queryService->method('runQuery')->willThrowException(new \Exception(
+      "SQLSTATE[42S22]: Column not found: 1054 Unknown column 'rate_per_100k' in 'field list'",
+    ));
+    $tools = $this->createTools(datastore: $datastore, query: $queryService);
+    $result = $tools->queryDatastore('test__1');
+    $this->assertSame('unknown_column', $result['error']);
+    $this->assertSame('rate_per_100k', $result['column']);
+    $this->assertEqualsCanonicalizing(['state', 'rate'], $result['available_columns']);
+    $this->assertSame('test__1', $result['resource_id']);
+  }
+
+  public function testQueryDatastoreUnknownColumnDkanQueryFactoryError(): void {
+    $storage = $this->createMock(DatabaseTableInterface::class);
+    $storage->method('getSchema')->willReturn(['fields' => ['x' => ['type' => 'int']]]);
+    $datastore = $this->createMock(DatastoreService::class);
+    $datastore->method('getStorage')->willReturn($storage);
+    $queryService = $this->createMock(Query::class);
+    $queryService->method('runQuery')->willThrowException(new \Exception('Bad query property.'));
+    $tools = $this->createTools(datastore: $datastore, query: $queryService);
+    $result = $tools->queryDatastore('test__1');
+    $this->assertSame('unknown_column', $result['error']);
+    $this->assertSame('(unknown)', $result['column']);
+  }
+
+  public function testSanityFlagsZeroRows(): void {
+    $queryService = $this->createMock(Query::class);
+    $queryService->method('runQuery')->willReturn(new RootedJsonData('{"results":[],"count":0}'));
+    $tools = $this->createTools(query: $queryService);
+    $result = $tools->queryDatastore('test__1');
+    $this->assertTrue($result['sanity_flags']['zero_rows']);
+    $this->assertFalse($result['sanity_flags']['row_cap_hit']);
+    $this->assertSame([], $result['sanity_flags']['all_null_columns']);
+    $this->assertNull($result['sanity_flags']['coverage_warning']);
+  }
+
+  public function testSanityFlagsRowCapHit(): void {
+    $rows = array_fill(0, 50, ['x' => '1']);
+    $queryService = $this->createMock(Query::class);
+    $queryService->method('runQuery')->willReturn(
+      new RootedJsonData(json_encode(['results' => $rows, 'count' => 1234]))
+    );
+    $tools = $this->createTools(query: $queryService);
+    $result = $tools->queryDatastore('test__1', limit: 50);
+    $this->assertTrue($result['sanity_flags']['row_cap_hit']);
+    $this->assertFalse($result['sanity_flags']['zero_rows']);
+  }
+
+  public function testSanityFlagsAllNullColumns(): void {
+    $rows = [
+      ['name' => 'Alice', 'middle' => NULL, 'age' => 30],
+      ['name' => 'Bob', 'middle' => NULL, 'age' => 25],
+    ];
+    $queryService = $this->createMock(Query::class);
+    $queryService->method('runQuery')->willReturn(
+      new RootedJsonData(json_encode(['results' => $rows, 'count' => 2]))
+    );
+    $tools = $this->createTools(query: $queryService);
+    $result = $tools->queryDatastore('test__1');
+    $this->assertSame(['middle'], $result['sanity_flags']['all_null_columns']);
+  }
+
+  public function testCoverageWarningWhenZeroRowsAndDateFilter(): void {
+    $storage = $this->createMock(DatabaseTableInterface::class);
+    $storage->method('getSchema')->willReturn([
+      'fields' => ['report_year' => ['type' => 'year']],
+    ]);
+    $datastore = $this->createMock(DatastoreService::class);
+    $datastore->method('getStorage')->willReturn($storage);
+    $queryService = $this->createMock(Query::class);
+    $queryService->method('runQuery')->willReturn(new RootedJsonData('{"results":[],"count":0}'));
+    $tools = $this->createTools(datastore: $datastore, query: $queryService);
+    $conditions = json_encode([['property' => 'report_year', 'value' => '1492', 'operator' => '=']]);
+    $result = $tools->queryDatastore('test__1', conditions: $conditions);
+    $this->assertTrue($result['sanity_flags']['zero_rows']);
+    $this->assertNotNull($result['sanity_flags']['coverage_warning']);
+    $this->assertStringContainsString('report_year', $result['sanity_flags']['coverage_warning']);
+  }
+
+  public function testCoverageWarningSkippedForNonDateFilter(): void {
+    $storage = $this->createMock(DatabaseTableInterface::class);
+    $storage->method('getSchema')->willReturn([
+      'fields' => ['city' => ['type' => 'varchar']],
+    ]);
+    $datastore = $this->createMock(DatastoreService::class);
+    $datastore->method('getStorage')->willReturn($storage);
+    $queryService = $this->createMock(Query::class);
+    $queryService->method('runQuery')->willReturn(new RootedJsonData('{"results":[],"count":0}'));
+    $tools = $this->createTools(datastore: $datastore, query: $queryService);
+    $conditions = json_encode([['property' => 'city', 'value' => 'Atlantis', 'operator' => '=']]);
+    $result = $tools->queryDatastore('test__1', conditions: $conditions);
+    $this->assertTrue($result['sanity_flags']['zero_rows']);
+    $this->assertNull($result['sanity_flags']['coverage_warning']);
   }
 
   public function testGetDatastoreSchema(): void {

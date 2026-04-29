@@ -114,17 +114,18 @@ class DatastoreTools {
       $result = $this->queryService->runQuery($datastoreQuery);
       $decoded = json_decode((string) $result, TRUE);
 
-      return [
-        'results' => $decoded['results'] ?? [],
-        'result_count' => count($decoded['results'] ?? []),
-        'total_rows' => $decoded['count'] ?? 0,
-        'limit' => $limit,
-        'offset' => $offset,
-      ];
+      return $this->buildSuccessResponse(
+        $decoded['results'] ?? [],
+        (int) ($decoded['count'] ?? 0),
+        $limit,
+        $offset,
+        $resourceId,
+        $query['conditions'] ?? NULL,
+      );
     }
     catch (\Exception $e) {
       $this->logger->error('MCP: Datastore query failed for @id: @error', ['@id' => $resourceId, '@error' => $e->getMessage()]);
-      return ['error' => $e->getMessage()];
+      return $this->buildErrorResponse($e, $resourceId);
     }
   }
 
@@ -402,17 +403,18 @@ class DatastoreTools {
       $result = $this->queryService->runQuery($datastoreQuery);
       $decoded = json_decode((string) $result, TRUE);
 
-      return [
-        'results' => $decoded['results'] ?? [],
-        'result_count' => count($decoded['results'] ?? []),
-        'total_rows' => $decoded['count'] ?? 0,
-        'limit' => $limit,
-        'offset' => $offset,
-      ];
+      return $this->buildSuccessResponse(
+        $decoded['results'] ?? [],
+        (int) ($decoded['count'] ?? 0),
+        $limit,
+        $offset,
+        $resourceId,
+        $query['conditions'] ?? NULL,
+      );
     }
     catch (\Exception $e) {
       $this->logger->error('MCP: Datastore join query failed for @id: @error', ['@id' => $resourceId, '@error' => $e->getMessage()]);
-      return ['error' => $e->getMessage()];
+      return $this->buildErrorResponse($e, $resourceId);
     }
   }
 
@@ -797,6 +799,164 @@ class DatastoreTools {
     catch (\Exception) {
       return [];
     }
+  }
+
+  /**
+   * Build a successful query response with sanity flags.
+   *
+   * @param array $results
+   *   Result rows from DatastoreQuery.
+   * @param int $totalRows
+   *   Total matching rows reported by DKAN's count.
+   * @param int $limit
+   *   The clamped row cap applied to this query.
+   * @param int $offset
+   *   The pagination offset.
+   * @param string $resourceId
+   *   The primary resource id (for coverage_warning column lookups).
+   * @param array|null $conditions
+   *   Parsed condition list (for coverage_warning detection).
+   */
+  protected function buildSuccessResponse(
+    array $results,
+    int $totalRows,
+    int $limit,
+    int $offset,
+    string $resourceId,
+    ?array $conditions,
+  ): array {
+    $resultCount = count($results);
+    $sanity = [
+      'zero_rows' => $resultCount === 0,
+      'all_null_columns' => $this->detectAllNullColumns($results),
+      'row_cap_hit' => $resultCount >= $limit && $totalRows > $resultCount,
+      'coverage_warning' => NULL,
+    ];
+    if ($sanity['zero_rows'] && $conditions) {
+      $sanity['coverage_warning'] = $this->maybeBuildCoverageWarning($conditions, $resourceId);
+    }
+    return [
+      'results' => $results,
+      'result_count' => $resultCount,
+      'total_rows' => $totalRows,
+      'limit' => $limit,
+      'offset' => $offset,
+      'sanity_flags' => $sanity,
+    ];
+  }
+
+  /**
+   * Build a structured error response, detecting unknown_column patterns.
+   *
+   * Returns a payload the agent can read and self-correct from rather than an
+   * opaque exception message.
+   */
+  protected function buildErrorResponse(\Exception $e, string $resourceId): array {
+    $message = $e->getMessage();
+    $column = $this->extractUnknownColumn($message);
+    if ($column !== NULL) {
+      return [
+        'error' => 'unknown_column',
+        'column' => $column,
+        'available_columns' => $this->getSchemaColumnNames($resourceId),
+        'resource_id' => $resourceId,
+        'message' => $message,
+      ];
+    }
+    return [
+      'error' => $message,
+      'resource_id' => $resourceId,
+    ];
+  }
+
+  /**
+   * Try to extract a column name from a column-not-found error message.
+   *
+   * Covers MySQL's "Unknown column 'X'" and DKAN QueryFactory's
+   * "Bad query property" / generic property-not-found messages. Returns the
+   * column name if found, NULL otherwise.
+   */
+  protected function extractUnknownColumn(string $message): ?string {
+    // MySQL: "SQLSTATE[42S22]: Column not found: 1054 Unknown column 'foo' in 'field list'"
+    if (preg_match("/Unknown column ['\"`]([^'\"`]+)['\"`]/i", $message, $m)) {
+      return $m[1];
+    }
+    // Generic: "column 'foo' does not exist", "property 'foo' not found".
+    if (preg_match("/(?:column|property|field)\s+['\"`]([^'\"`]+)['\"`]\s+(?:does\s+not\s+exist|not\s+found|is\s+unknown)/i", $message, $m)) {
+      return $m[1];
+    }
+    // DKAN QueryFactory: "Bad query property" — column name not in message.
+    if (stripos($message, 'bad query property') !== FALSE) {
+      return '(unknown)';
+    }
+    return NULL;
+  }
+
+  /**
+   * Return columns whose value is NULL in every returned row.
+   *
+   * Skipped on empty result sets (would falsely flag every column).
+   */
+  protected function detectAllNullColumns(array $results): array {
+    if (!$results) {
+      return [];
+    }
+    $columns = array_keys($results[0]);
+    $allNull = [];
+    foreach ($columns as $col) {
+      $sawValue = FALSE;
+      foreach ($results as $row) {
+        if (array_key_exists($col, $row) && $row[$col] !== NULL && $row[$col] !== '') {
+          $sawValue = TRUE;
+          break;
+        }
+      }
+      if (!$sawValue) {
+        $allNull[] = $col;
+      }
+    }
+    return $allNull;
+  }
+
+  /**
+   * If conditions filter on a date-like column and we got 0 rows, flag it.
+   *
+   * Cheap heuristic: looks at the schema for any column referenced in
+   * conditions and checks if its type smells like a date. Avoids running
+   * extra aggregation queries — the warning just nudges the agent to verify
+   * coverage via getDatastoreStats.
+   */
+  protected function maybeBuildCoverageWarning(array $conditions, string $resourceId): ?string {
+    try {
+      [$identifier, $version] = $this->parseResourceId($resourceId);
+      $storage = $this->datastoreService->getStorage($identifier, $version);
+      $schema = $storage->getSchema();
+      $fields = $schema['fields'] ?? [];
+    }
+    catch (\Throwable) {
+      return NULL;
+    }
+    $dateCols = [];
+    foreach ($conditions as $cond) {
+      if (!is_array($cond) || empty($cond['property'])) {
+        continue;
+      }
+      $col = is_string($cond['property']) ? $cond['property'] : ($cond['property']['property'] ?? NULL);
+      if (!$col || !isset($fields[$col])) {
+        continue;
+      }
+      $type = strtolower((string) ($fields[$col]['type'] ?? ''));
+      if (str_contains($type, 'date') || str_contains($type, 'time') || str_contains($type, 'year')) {
+        $dateCols[] = $col;
+      }
+    }
+    if (!$dateCols) {
+      return NULL;
+    }
+    return sprintf(
+      "Filter on date-like column(s) [%s] returned 0 rows — verify the value is within the dataset's coverage window via get_datastore_stats.",
+      implode(', ', $dateCols),
+    );
   }
 
   /**
