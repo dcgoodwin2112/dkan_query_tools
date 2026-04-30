@@ -72,8 +72,9 @@ class DatastoreTools {
     int $offset = 0,
     ?string $expressions = NULL,
     ?string $groupings = NULL,
+    int $maxLimit = 500,
   ): array {
-    $limit = min(max($limit, 1), 500);
+    $limit = min(max($limit, 1), max(1, $maxLimit));
 
     $query = [
       'resources' => [['id' => $resourceId, 'alias' => 't']],
@@ -505,8 +506,9 @@ class DatastoreTools {
     int $offset = 0,
     ?string $expressions = NULL,
     ?string $groupings = NULL,
+    int $maxLimit = 500,
   ): array {
-    $limit = min(max($limit, 1), 500);
+    $limit = min(max($limit, 1), max(1, $maxLimit));
 
     $query = [
       'resources' => [

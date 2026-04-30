@@ -13,8 +13,8 @@ Provides three Drupal services that wrap DKAN's metastore, datastore, and search
 ## Consumers
 
 - `dkan_mcp` — exposes these methods as MCP tools.
-- `dkan_nl_query` — invokes them from the LLM agentic loop.
 - `dkan_drupal_ai_query` — wraps each method in a Drupal AI FunctionCall plugin.
+- `dkan_nl_query` — _deprecated_ in favor of `dkan_drupal_ai_query`; previously invoked these from a bespoke LLM agentic loop.
 
 ## Requirements
 
