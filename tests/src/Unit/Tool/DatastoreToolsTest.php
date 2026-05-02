@@ -126,6 +126,140 @@ class DatastoreToolsTest extends TestCase {
     $this->assertSame('(unknown)', $result['column']);
   }
 
+  public function testQueryDatastoreCanonicalizesColumnCase(): void {
+    $storage = $this->createMock(DatabaseTableInterface::class);
+    $storage->method('getSchema')->willReturn([
+      'fields' => [
+        'record_number' => ['type' => 'serial'],
+        'City' => ['type' => 'varchar'],
+        'Violent_Crimes' => ['type' => 'int'],
+      ],
+    ]);
+    $datastore = $this->createMock(DatastoreService::class);
+    $datastore->method('getStorage')->willReturn($storage);
+    $captured = NULL;
+    $queryService = $this->createMock(Query::class);
+    $queryService->method('runQuery')->willReturnCallback(function ($q) use (&$captured) {
+      $captured = (string) $q;
+      return new RootedJsonData('{"results":[],"count":0}');
+    });
+    $tools = $this->createTools(datastore: $datastore, query: $queryService);
+    $tools->queryDatastore(
+      'test__1',
+      columns: 'city,violent_crimes',
+      conditions: json_encode([['property' => 'CITY', 'value' => 'Houston', 'operator' => '=']]),
+      sortField: 'VIOLENT_crimes',
+    );
+    $this->assertNotNull($captured);
+    $decoded = json_decode($captured, TRUE);
+    $this->assertSame(['City', 'Violent_Crimes'], $decoded['properties']);
+    $this->assertSame('City', $decoded['conditions'][0]['property']);
+    $this->assertSame('Violent_Crimes', $decoded['sorts'][0]['property']);
+  }
+
+  public function testQueryDatastoreCanonicalizesGroupings(): void {
+    $storage = $this->createMock(DatabaseTableInterface::class);
+    $storage->method('getSchema')->willReturn([
+      'fields' => ['record_number' => ['type' => 'serial'], 'State' => ['type' => 'varchar']],
+    ]);
+    $datastore = $this->createMock(DatastoreService::class);
+    $datastore->method('getStorage')->willReturn($storage);
+    $captured = NULL;
+    $queryService = $this->createMock(Query::class);
+    $queryService->method('runQuery')->willReturnCallback(function ($q) use (&$captured) {
+      $captured = (string) $q;
+      return new RootedJsonData('{"results":[],"count":0}');
+    });
+    $tools = $this->createTools(datastore: $datastore, query: $queryService);
+    $tools->queryDatastore('test__1', groupings: 'state');
+    $decoded = json_decode($captured, TRUE);
+    $this->assertSame('State', $decoded['groupings'][0]['property']);
+  }
+
+  public function testQueryDatastoreLeavesAmbiguousCaseAlone(): void {
+    $storage = $this->createMock(DatabaseTableInterface::class);
+    // Two columns differing only by case → ambiguous, no auto-correct.
+    $storage->method('getSchema')->willReturn([
+      'fields' => [
+        'record_number' => ['type' => 'serial'],
+        'Date' => ['type' => 'date'],
+        'date' => ['type' => 'date'],
+      ],
+    ]);
+    $datastore = $this->createMock(DatastoreService::class);
+    $datastore->method('getStorage')->willReturn($storage);
+    $captured = NULL;
+    $queryService = $this->createMock(Query::class);
+    $queryService->method('runQuery')->willReturnCallback(function ($q) use (&$captured) {
+      $captured = (string) $q;
+      return new RootedJsonData('{"results":[],"count":0}');
+    });
+    $tools = $this->createTools(datastore: $datastore, query: $queryService);
+    $tools->queryDatastore('test__1', columns: 'DATE');
+    $decoded = json_decode($captured, TRUE);
+    $this->assertSame(['DATE'], $decoded['properties']);
+  }
+
+  public function testDistinctValuesCanonicalizesColumnCase(): void {
+    $storage = $this->createMock(DatabaseTableInterface::class);
+    $storage->method('getSchema')->willReturn([
+      'fields' => [
+        'record_number' => ['type' => 'serial'],
+        'State' => ['type' => 'varchar'],
+      ],
+    ]);
+    $storage->method('getTableName')->willReturn('datastore_test');
+    $statement = $this->createMock(StatementInterface::class);
+    $statement->method('fetchCol')->willReturn(['CA', 'TX']);
+    $select = $this->createMock(SelectInterface::class);
+    $select->method('addField')->willReturnSelf();
+    $select->method('distinct')->willReturnSelf();
+    $select->method('orderBy')->willReturnSelf();
+    $select->method('range')->willReturnSelf();
+    $select->method('execute')->willReturn($statement);
+    $database = $this->createMock(Connection::class);
+    $database->method('select')->willReturn($select);
+    $datastore = $this->createMock(DatastoreService::class);
+    $datastore->method('getStorage')->willReturn($storage);
+    $tools = $this->createTools(datastore: $datastore, database: $database);
+    // Lowercase input on a "State"-cased column should auto-correct.
+    $result = $tools->distinctValues('test__1', 'state');
+    $this->assertArrayNotHasKey('error', $result);
+    $this->assertSame('State', $result['column']);
+  }
+
+  public function testGetDatastoreStatsCanonicalizesColumnCase(): void {
+    $storage = $this->createMock(DatabaseTableInterface::class);
+    $storage->method('getSchema')->willReturn([
+      'fields' => [
+        'record_number' => ['type' => 'serial'],
+        'State' => ['type' => 'varchar'],
+        'Population' => ['type' => 'int'],
+      ],
+    ]);
+    $storage->method('getTableName')->willReturn('datastore_test');
+    $statement = $this->createMock(StatementInterface::class);
+    $statement->method('fetchAssoc')->willReturn([
+      'total_rows' => 50,
+      'State__non_null' => 50,
+      'State__distinct' => 50,
+      'State__min' => 'AK',
+      'State__max' => 'WY',
+    ]);
+    $select = $this->createMock(SelectInterface::class);
+    $select->method('addExpression')->willReturnSelf();
+    $select->method('execute')->willReturn($statement);
+    $database = $this->createMock(Connection::class);
+    $database->method('select')->willReturn($select);
+    $datastore = $this->createMock(DatastoreService::class);
+    $datastore->method('getStorage')->willReturn($storage);
+    $tools = $this->createTools(datastore: $datastore, database: $database);
+    // Lowercase input on a "State"-cased column should auto-correct, no error.
+    $result = $tools->getDatastoreStats('test__1', 'state');
+    $this->assertArrayNotHasKey('error', $result);
+    $this->assertSame('State', $result['columns'][0]['name']);
+  }
+
   public function testSanityFlagsZeroRows(): void {
     $queryService = $this->createMock(Query::class);
     $queryService->method('runQuery')->willReturn(new RootedJsonData('{"results":[],"count":0}'));
