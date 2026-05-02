@@ -143,7 +143,8 @@ class DatastoreTools {
       if (!is_array($parsed) || !array_is_list($parsed)) {
         return ['error' => 'Invalid conditions: must be a JSON array of condition objects, e.g. [{"property":"col","value":"val","operator":"="}]'];
       }
-      $query['conditions'] = $this->canonicalizeConditionProperties($parsed, $resourceId);
+      $parsed = $this->canonicalizeConditionProperties($parsed, $resourceId);
+      $query['conditions'] = self::canonicalizeOperators($parsed);
     }
 
     if ($sortField) {
@@ -604,7 +605,7 @@ class DatastoreTools {
       if (!is_array($parsed) || !array_is_list($parsed)) {
         return ['error' => 'Invalid conditions: must be a JSON array of condition objects.'];
       }
-      $query['conditions'] = $parsed;
+      $query['conditions'] = self::canonicalizeOperators($parsed);
     }
 
     // Parse sort with optional resource qualification.
@@ -1075,6 +1076,37 @@ class DatastoreTools {
         continue;
       }
       $out[] = $col;
+    }
+    return $out;
+  }
+
+  /**
+   * Decode HTML entities on the `operator` field of every condition.
+   *
+   * Some LLMs HTML-encode comparison operators when emitting JSON tool
+   * arguments (e.g. `&gt;` instead of `>`). DKAN's DatastoreQuery enforces
+   * a strict operator enum, so the encoded form fails validation and the
+   * model can spin retrying the same broken JSON. We decode here so the
+   * agent gets one error instead of N. Walks one level of nested AND/OR
+   * groups for parity with property canonicalization. Touches `operator`
+   * only — `value` may legitimately contain HTML entities.
+   *
+   * @param array $conditions
+   *   Parsed conditions array from the JSON input.
+   *
+   * @return array
+   *   The conditions array with HTML-encoded operators decoded.
+   */
+  protected static function canonicalizeOperators(array $conditions): array {
+    $out = [];
+    foreach ($conditions as $cond) {
+      if (is_array($cond) && isset($cond['operator']) && is_string($cond['operator'])) {
+        $cond['operator'] = html_entity_decode($cond['operator'], ENT_QUOTES | ENT_HTML5);
+      }
+      if (is_array($cond) && isset($cond['conditions']) && is_array($cond['conditions'])) {
+        $cond['conditions'] = self::canonicalizeOperators($cond['conditions']);
+      }
+      $out[] = $cond;
     }
     return $out;
   }

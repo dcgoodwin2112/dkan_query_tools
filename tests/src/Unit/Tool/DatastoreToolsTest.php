@@ -1996,4 +1996,93 @@ class DatastoreToolsTest extends TestCase {
     $this->assertStringContainsString('conflicts with a column', $result['error']);
   }
 
+  public function testQueryDatastoreDecodesHtmlEntityOperators(): void {
+    $storage = $this->createMock(DatabaseTableInterface::class);
+    $storage->method('getSchema')->willReturn([
+      'fields' => ['record_number' => ['type' => 'serial'], 'rate' => ['type' => 'int']],
+    ]);
+    $datastore = $this->createMock(DatastoreService::class);
+    $datastore->method('getStorage')->willReturn($storage);
+    $captured = NULL;
+    $queryService = $this->createMock(Query::class);
+    $queryService->method('runQuery')->willReturnCallback(function ($q) use (&$captured) {
+      $captured = (string) $q;
+      return new RootedJsonData('{"results":[],"count":0}');
+    });
+
+    $tools = $this->createTools(datastore: $datastore, query: $queryService);
+    // Operators arriving HTML-encoded — gpt-5.4-mini does this for `>`/`<`.
+    $tools->queryDatastore(
+      'test__1',
+      conditions: json_encode([
+        ['property' => 'rate', 'value' => '380', 'operator' => '&gt;'],
+        ['property' => 'rate', 'value' => '0', 'operator' => '&lt;='],
+      ]),
+    );
+    $decoded = json_decode($captured, TRUE);
+    $this->assertSame('>', $decoded['conditions'][0]['operator']);
+    $this->assertSame('<=', $decoded['conditions'][1]['operator']);
+  }
+
+  public function testQueryDatastoreDecodesOperatorsInNestedAndOrGroups(): void {
+    $storage = $this->createMock(DatabaseTableInterface::class);
+    $storage->method('getSchema')->willReturn([
+      'fields' => ['record_number' => ['type' => 'serial'], 'rate' => ['type' => 'int']],
+    ]);
+    $datastore = $this->createMock(DatastoreService::class);
+    $datastore->method('getStorage')->willReturn($storage);
+    $captured = NULL;
+    $queryService = $this->createMock(Query::class);
+    $queryService->method('runQuery')->willReturnCallback(function ($q) use (&$captured) {
+      $captured = (string) $q;
+      return new RootedJsonData('{"results":[],"count":0}');
+    });
+
+    $tools = $this->createTools(datastore: $datastore, query: $queryService);
+    $tools->queryDatastore(
+      'test__1',
+      conditions: json_encode([
+        [
+          'groupOperator' => 'or',
+          'conditions' => [
+            ['property' => 'rate', 'value' => '100', 'operator' => '&lt;'],
+            ['property' => 'rate', 'value' => '500', 'operator' => '&gt;='],
+          ],
+        ],
+      ]),
+    );
+    $decoded = json_decode($captured, TRUE);
+    $sub = $decoded['conditions'][0]['conditions'];
+    $this->assertSame('<', $sub[0]['operator']);
+    $this->assertSame('>=', $sub[1]['operator']);
+  }
+
+  public function testQueryDatastoreLeavesPlainOperatorsAndValuesUntouched(): void {
+    // Decoding is idempotent on already-plain operators; values keep their
+    // entities so we don't corrupt legitimate data.
+    $storage = $this->createMock(DatabaseTableInterface::class);
+    $storage->method('getSchema')->willReturn([
+      'fields' => ['record_number' => ['type' => 'serial'], 'name' => ['type' => 'varchar']],
+    ]);
+    $datastore = $this->createMock(DatastoreService::class);
+    $datastore->method('getStorage')->willReturn($storage);
+    $captured = NULL;
+    $queryService = $this->createMock(Query::class);
+    $queryService->method('runQuery')->willReturnCallback(function ($q) use (&$captured) {
+      $captured = (string) $q;
+      return new RootedJsonData('{"results":[],"count":0}');
+    });
+
+    $tools = $this->createTools(datastore: $datastore, query: $queryService);
+    $tools->queryDatastore(
+      'test__1',
+      conditions: json_encode([
+        ['property' => 'name', 'value' => 'Smith &amp; Jones', 'operator' => '='],
+      ]),
+    );
+    $decoded = json_decode($captured, TRUE);
+    $this->assertSame('=', $decoded['conditions'][0]['operator']);
+    $this->assertSame('Smith &amp; Jones', $decoded['conditions'][0]['value']);
+  }
+
 }
