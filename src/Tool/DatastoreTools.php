@@ -27,6 +27,17 @@ class DatastoreTools {
   protected array $dictionaryCache = [];
 
   /**
+   * Per-instance memo of resourceId → schema column-name list.
+   *
+   * canonicalizeColumnNames() can fire several times per query (one per
+   * input axis: columns, groupings, sort, conditions); the memo keeps the
+   * cost to a single getStorage()/getSchema() per resource per request.
+   *
+   * @var array<string, string[]>
+   */
+  protected array $schemaColumnsCache = [];
+
+  /**
    * Service-level toggle for dictionary enrichment.
    *
    * Defaults to TRUE (production). Used by the eval harness to compare
@@ -88,9 +99,13 @@ class DatastoreTools {
     $properties = [];
     if ($columns) {
       $properties = array_map('trim', explode(',', $columns));
+      $properties = $this->canonicalizeColumnNames($resourceId, $properties);
     }
 
     $groupList = $groupings ? array_map('trim', explode(',', $groupings)) : [];
+    if ($groupList) {
+      $groupList = $this->canonicalizeColumnNames($resourceId, $groupList);
+    }
 
     if ($expressions) {
       $schemaColumns = $this->getSchemaColumnNames($resourceId);
@@ -128,13 +143,14 @@ class DatastoreTools {
       if (!is_array($parsed) || !array_is_list($parsed)) {
         return ['error' => 'Invalid conditions: must be a JSON array of condition objects, e.g. [{"property":"col","value":"val","operator":"="}]'];
       }
-      $query['conditions'] = $parsed;
+      $query['conditions'] = $this->canonicalizeConditionProperties($parsed, $resourceId);
     }
 
     if ($sortField) {
+      $sortFields = $this->canonicalizeColumnNames($resourceId, [$sortField]);
       $query['sorts'] = [
         [
-          'property' => $sortField,
+          'property' => $sortFields[0],
           'order' => strtolower($sortDirection) === 'desc' ? 'desc' : 'asc',
         ],
       ];
@@ -236,6 +252,8 @@ class DatastoreTools {
       [$identifier, $version] = $this->parseResourceId($resourceId);
       $storage = $this->datastoreService->getStorage($identifier, $version);
       $schema = $storage->getSchema();
+      $canonical = $this->canonicalizeColumnNames($resourceId, [$column]);
+      $column = $canonical[0];
       if (!isset($schema['fields'][$column]) || $column === 'record_number') {
         return ['error' => "Unknown column '{$column}' for resource '{$resourceId}'"];
       }
@@ -857,6 +875,7 @@ class DatastoreTools {
       // Filter to requested columns if specified.
       if ($columns !== NULL && $columns !== '') {
         $requested = array_map('trim', explode(',', $columns));
+        $requested = $this->canonicalizeColumnNames($resourceId, $requested);
         $unknown = array_diff($requested, array_keys($fields));
         if ($unknown) {
           return ['error' => 'Unknown columns: ' . implode(', ', $unknown)];
@@ -990,16 +1009,128 @@ class DatastoreTools {
    * Get column names from a resource's schema, excluding record_number.
    */
   protected function getSchemaColumnNames(string $resourceId): array {
+    if (isset($this->schemaColumnsCache[$resourceId])) {
+      return $this->schemaColumnsCache[$resourceId];
+    }
     try {
       [$identifier, $version] = $this->parseResourceId($resourceId);
       $storage = $this->datastoreService->getStorage($identifier, $version);
       $schema = $storage->getSchema();
       $columns = array_keys($schema['fields'] ?? []);
-      return array_values(array_filter($columns, fn($c) => $c !== 'record_number'));
+      $columns = array_values(array_filter($columns, fn($c) => $c !== 'record_number'));
+      return $this->schemaColumnsCache[$resourceId] = $columns;
     }
     catch (\Exception) {
-      return [];
+      return $this->schemaColumnsCache[$resourceId] = [];
     }
+  }
+
+  /**
+   * Map user-supplied column names to canonical schema casing.
+   *
+   * Forgives case mismatches between what the LLM (or any caller) typed
+   * and the column names actually stored in the schema, eliminating a
+   * recurring class of "unknown_column" errors that wastes a turn even
+   * though `available_columns` makes recovery possible.
+   *
+   * Behavior:
+   *  - Exact match wins (no rewriting needed).
+   *  - When no exact match exists but exactly one case-insensitive match
+   *    does, rewrite to the schema's casing.
+   *  - Multiple CI matches (e.g. schema has both `Date` and `date`) are
+   *    ambiguous: pass the input through unchanged so the downstream
+   *    error path stays authoritative.
+   *  - Empty schema (lookup failed): pass through unchanged.
+   *
+   * @param string $resourceId
+   *   The (already-resolved) resource id whose schema to canonicalize against.
+   * @param string[] $columns
+   *   Caller-supplied column names. Order is preserved.
+   *
+   * @return string[]
+   *   Same order, with case corrected where a unique CI match exists.
+   */
+  protected function canonicalizeColumnNames(string $resourceId, array $columns): array {
+    if (!$columns) {
+      return $columns;
+    }
+    $schemaColumns = $this->getSchemaColumnNames($resourceId);
+    if (!$schemaColumns) {
+      return $columns;
+    }
+    $exact = array_flip($schemaColumns);
+    $byLower = [];
+    foreach ($schemaColumns as $canonical) {
+      $byLower[strtolower($canonical)][] = $canonical;
+    }
+    $out = [];
+    foreach ($columns as $col) {
+      if (isset($exact[$col])) {
+        $out[] = $col;
+        continue;
+      }
+      $lower = strtolower($col);
+      if (isset($byLower[$lower]) && count($byLower[$lower]) === 1) {
+        $out[] = $byLower[$lower][0];
+        continue;
+      }
+      $out[] = $col;
+    }
+    return $out;
+  }
+
+  /**
+   * Canonicalize the `property` field of every condition in-place.
+   *
+   * Walks one level of nested condition groups so AND/OR groupings get
+   * the same case-correction as flat conditions. Anything else is
+   * passed through untouched.
+   *
+   * @param array $conditions
+   *   Parsed conditions array from the JSON input.
+   * @param string $resourceId
+   *   The resource id whose schema to canonicalize against.
+   *
+   * @return array
+   *   The conditions array with property names case-corrected.
+   */
+  protected function canonicalizeConditionProperties(array $conditions, string $resourceId): array {
+    $properties = [];
+    foreach ($conditions as $cond) {
+      if (is_array($cond) && isset($cond['property'])) {
+        $properties[] = (string) $cond['property'];
+      }
+      if (is_array($cond) && isset($cond['conditions']) && is_array($cond['conditions'])) {
+        foreach ($cond['conditions'] as $sub) {
+          if (is_array($sub) && isset($sub['property'])) {
+            $properties[] = (string) $sub['property'];
+          }
+        }
+      }
+    }
+    if (!$properties) {
+      return $conditions;
+    }
+    $canonical = $this->canonicalizeColumnNames($resourceId, $properties);
+    $map = array_combine($properties, $canonical);
+    $out = [];
+    foreach ($conditions as $cond) {
+      if (is_array($cond) && isset($cond['property']) && isset($map[$cond['property']])) {
+        $cond['property'] = $map[$cond['property']];
+      }
+      if (is_array($cond) && isset($cond['conditions']) && is_array($cond['conditions'])) {
+        $sub = [];
+        foreach ($cond['conditions'] as $c) {
+          if (is_array($c) && isset($c['property']) && isset($map[$c['property']])) {
+            $c['property'] = $map[$c['property']];
+          }
+          $sub[] = $c;
+        }
+        $cond['conditions'] = $sub;
+      }
+      $out[] = $cond;
+    }
+    return $out;
   }
 
   /**
