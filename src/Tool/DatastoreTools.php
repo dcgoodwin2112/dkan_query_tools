@@ -144,7 +144,11 @@ class DatastoreTools {
         return ['error' => 'Invalid conditions: must be a JSON array of condition objects, e.g. [{"property":"col","value":"val","operator":"="}]'];
       }
       $parsed = $this->canonicalizeConditionProperties($parsed, $resourceId);
-      $query['conditions'] = self::canonicalizeOperators($parsed);
+      $parsed = self::canonicalizeOperators($parsed);
+      if ($opError = self::validateOperators($parsed)) {
+        return ['error' => $opError];
+      }
+      $query['conditions'] = $parsed;
     }
 
     if ($sortField) {
@@ -605,7 +609,11 @@ class DatastoreTools {
       if (!is_array($parsed) || !array_is_list($parsed)) {
         return ['error' => 'Invalid conditions: must be a JSON array of condition objects.'];
       }
-      $query['conditions'] = self::canonicalizeOperators($parsed);
+      $parsed = self::canonicalizeOperators($parsed);
+      if ($opError = self::validateOperators($parsed)) {
+        return ['error' => $opError];
+      }
+      $query['conditions'] = $parsed;
     }
 
     // Parse sort with optional resource qualification.
@@ -1109,6 +1117,71 @@ class DatastoreTools {
       $out[] = $cond;
     }
     return $out;
+  }
+
+  /**
+   * Reject conditions with an operator outside DKAN's allowed enum.
+   *
+   * Should run AFTER canonicalizeOperators() so HTML-encoded forms like
+   * `&gt;` get rescued before validation. The empty-operator case is the
+   * one that motivated this guard: both Anthropic and OpenAI models
+   * occasionally drop the literal `<` character on its way to tool-call
+   * JSON and emit `"operator": ""`. RootedJsonData rejects that with the
+   * generic "JSON Schema validation failed.", which gives the agent no
+   * field name and no enum hint to recover from. A friendly,
+   * field-named error lets the agent self-correct on the next turn
+   * (and helps Haiku-class models avoid hallucinating from cached
+   * data when they exhaust retries).
+   *
+   * Walks the same nested AND/OR group shape as canonicalizeOperators.
+   *
+   * @param array $conditions
+   *   Parsed and canonicalized conditions array.
+   *
+   * @return string|null
+   *   A friendly error message naming the offending property and
+   *   listing the allowed operators, or NULL if every condition is
+   *   valid. Returns the FIRST violation found.
+   */
+  protected static function validateOperators(array $conditions): ?string {
+    // Strict enum from DKAN's query.json schema (case-sensitive).
+    static $strict = ['=', '<>', '<', '<=', '>', '>='];
+    // Alphanumeric operators (case-insensitive in the schema).
+    static $alpha = ['like', 'between', 'in', 'not in', 'contains', 'starts with', 'match'];
+
+    foreach ($conditions as $cond) {
+      if (!is_array($cond)) {
+        continue;
+      }
+      if (isset($cond['conditions']) && is_array($cond['conditions'])) {
+        $err = self::validateOperators($cond['conditions']);
+        if ($err !== NULL) {
+          return $err;
+        }
+        continue;
+      }
+      // Operator absent or non-string: leave it to RootedJsonData. The
+      // schema applies a default of "=" when the field is missing
+      // entirely, and we shouldn't override that here.
+      if (!isset($cond['operator']) || !is_string($cond['operator'])) {
+        continue;
+      }
+      $op = $cond['operator'];
+      if (in_array($op, $strict, TRUE) || in_array(strtolower($op), $alpha, TRUE)) {
+        continue;
+      }
+      $property = (isset($cond['property']) && is_string($cond['property']) && $cond['property'] !== '')
+        ? $cond['property']
+        : '(unknown)';
+      $opDisplay = $op === '' ? 'is empty' : 'is ' . var_export($op, TRUE);
+      return sprintf(
+        'Invalid condition for property "%s": operator %s. Operator must be one of: %s.',
+        $property,
+        $opDisplay,
+        implode(', ', array_merge($strict, $alpha))
+      );
+    }
+    return NULL;
   }
 
   /**

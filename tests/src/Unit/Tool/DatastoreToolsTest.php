@@ -589,6 +589,74 @@ class DatastoreToolsTest extends TestCase {
     $this->assertStringContainsString('must be a JSON array', $result['error']);
   }
 
+  public function testQueryDatastoreEmptyOperatorReturnsFriendlyError(): void {
+    $tools = $this->createTools();
+    $result = $tools->queryDatastore(
+      'test-resource',
+      conditions: '[{"property":"population","value":"1000000","operator":""}]'
+    );
+
+    $this->assertArrayHasKey('error', $result);
+    $this->assertStringContainsString('property "population"', $result['error']);
+    $this->assertStringContainsString('is empty', $result['error']);
+    $this->assertStringContainsString('<', $result['error']);
+    $this->assertStringContainsString('like', $result['error']);
+  }
+
+  public function testQueryDatastoreUnrecognizedOperatorReturnsFriendlyError(): void {
+    $tools = $this->createTools();
+    $result = $tools->queryDatastore(
+      'test-resource',
+      conditions: '[{"property":"city","value":"Houston","operator":"equals"}]'
+    );
+
+    $this->assertArrayHasKey('error', $result);
+    $this->assertStringContainsString('property "city"', $result['error']);
+    $this->assertStringContainsString("'equals'", $result['error']);
+    $this->assertStringContainsString('Operator must be one of', $result['error']);
+  }
+
+  /**
+   * HTML-encoded operators get rescued by canonicalize before validate runs.
+   *
+   * Regression guard: validateOperators must NOT fire for &gt; / &lt; etc.
+   * because canonicalizeOperators decodes them first.
+   */
+  public function testQueryDatastoreHtmlEncodedOperatorPassesValidation(): void {
+    $tools = $this->createTools();
+    // Valid query with encoded operator. We're not asserting on the
+    // (mocked) result content — just that we don't get the friendly
+    // operator-validation error.
+    $result = $tools->queryDatastore(
+      'test-resource',
+      conditions: '[{"property":"city","value":"Houston","operator":"&gt;"}]'
+    );
+    if (isset($result['error'])) {
+      $this->assertStringNotContainsString('Operator must be one of', $result['error']);
+    }
+    else {
+      $this->assertArrayNotHasKey('error', $result);
+    }
+  }
+
+  public function testQueryDatastoreOperatorValidationWalksNestedGroups(): void {
+    $tools = $this->createTools();
+    $nested = json_encode([
+      [
+        'groupOperator' => 'or',
+        'conditions' => [
+          ['property' => 'state', 'value' => 'CA', 'operator' => '='],
+          ['property' => 'population', 'value' => '5000', 'operator' => ''],
+        ],
+      ],
+    ]);
+    $result = $tools->queryDatastore('test-resource', conditions: $nested);
+
+    $this->assertArrayHasKey('error', $result);
+    $this->assertStringContainsString('property "population"', $result['error']);
+    $this->assertStringContainsString('is empty', $result['error']);
+  }
+
   public function testGetImportStatus(): void {
     $datastore = $this->createMock(DatastoreService::class);
     $datastore->expects($this->once())
