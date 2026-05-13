@@ -2,8 +2,8 @@
 
 namespace Drupal\dkan_query_tools\Tool;
 
-use Drupal\common\DatasetInfo;
-use Drupal\metastore\MetastoreService;
+use Drupal\dkan_common\DatasetInfo;
+use Drupal\dkan_metastore\MetastoreService;
 
 /**
  * Tools for DKAN metastore operations.

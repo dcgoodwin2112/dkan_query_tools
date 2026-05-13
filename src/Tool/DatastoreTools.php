@@ -2,12 +2,12 @@
 
 namespace Drupal\dkan_query_tools\Tool;
 
-use Drupal\common\DatasetInfo;
+use Drupal\dkan_common\DatasetInfo;
 use Drupal\Core\Database\Connection;
-use Drupal\datastore\DatastoreService;
-use Drupal\datastore\Service\DatastoreQuery;
-use Drupal\datastore\Service\Query;
-use Drupal\metastore\MetastoreService;
+use Drupal\dkan_datastore\DatastoreService;
+use Drupal\dkan_datastore\Service\DatastoreQuery;
+use Drupal\dkan_datastore\Service\Query;
+use Drupal\dkan_metastore\MetastoreService;
 use Psr\Log\LoggerInterface;
 
 /**
