@@ -17,6 +17,13 @@ class SearchTools {
 
   /**
    * Search datasets by keyword via the DKAN search API.
+   *
+   * @param string $keyword
+   *   Search term.
+   * @param int $page
+   *   Page number (1-based).
+   * @param int $pageSize
+   *   Results per page.
    */
   public function searchDatasets(string $keyword, int $page = 1, int $pageSize = 10): array {
     $pageSize = min(max($pageSize, 1), 50);

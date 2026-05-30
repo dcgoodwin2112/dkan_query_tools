@@ -1,11 +1,11 @@
 <?php
 
-namespace Drupal\datastore;
+namespace Drupal\dkan_datastore;
 
-use Drupal\common\Storage\DatabaseTableInterface;
+use Drupal\dkan_common\Storage\DatabaseTableInterface;
 
 /**
- * Stub for Drupal\datastore\DatastoreService.
+ * Stub for Drupal\dkan_datastore\DatastoreService.
  */
 class DatastoreService {
 

@@ -128,8 +128,18 @@ class SearchToolsTest extends TestCase {
       ->willReturn(new Response(200, [], $body));
 
     // No Symfony request (Drush context), no DRUSH_OPTIONS_URI.
-    $tools = $this->createTools($client);
-    $result = $tools->searchDatasets('test');
+    // DDEV's container env exports DRUSH_OPTIONS_URI; isolate the test.
+    $previousUri = getenv('DRUSH_OPTIONS_URI');
+    putenv('DRUSH_OPTIONS_URI');
+    try {
+      $tools = $this->createTools($client);
+      $result = $tools->searchDatasets('test');
+    }
+    finally {
+      if ($previousUri !== FALSE) {
+        putenv('DRUSH_OPTIONS_URI=' . $previousUri);
+      }
+    }
 
     $this->assertArrayHasKey('results', $result);
   }

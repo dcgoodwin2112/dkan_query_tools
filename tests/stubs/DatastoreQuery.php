@@ -1,9 +1,9 @@
 <?php
 
-namespace Drupal\datastore\Service;
+namespace Drupal\dkan_datastore\Service;
 
 /**
- * Stub for Drupal\datastore\Service\DatastoreQuery.
+ * Stub for Drupal\dkan_datastore\Service\DatastoreQuery.
  *
  * The real class extends RootedJsonData, but for unit testing purposes
  * we use a simple stub that stores the JSON without validation.

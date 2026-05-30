@@ -2,12 +2,12 @@
 
 namespace Drupal\dkan_query_tools\Tool;
 
-use Drupal\common\DatasetInfo;
+use Drupal\dkan_common\DatasetInfo;
 use Drupal\Core\Database\Connection;
-use Drupal\datastore\DatastoreService;
-use Drupal\datastore\Service\DatastoreQuery;
-use Drupal\datastore\Service\Query;
-use Drupal\metastore\MetastoreService;
+use Drupal\dkan_datastore\DatastoreService;
+use Drupal\dkan_datastore\Service\DatastoreQuery;
+use Drupal\dkan_datastore\Service\Query;
+use Drupal\dkan_metastore\MetastoreService;
 use Psr\Log\LoggerInterface;
 
 /**
@@ -29,13 +29,20 @@ class DatastoreTools {
   /**
    * Per-instance memo of resourceId → schema column-name list.
    *
-   * canonicalizeColumnNames() can fire several times per query (one per
-   * input axis: columns, groupings, sort, conditions); the memo keeps the
+   * The canonicalizeColumnNames() method can fire several times per query (one
+   * per input axis: columns, groupings, sort, conditions); the memo keeps the
    * cost to a single getStorage()/getSchema() per resource per request.
    *
    * @var array<string, string[]>
    */
   protected array $schemaColumnsCache = [];
+
+  /**
+   * Per-instance memo of bare-UUID => [identifier, version|null] resolution.
+   *
+   * @var array<string, array{string, string|null}>
+   */
+  protected array $resourceIdCache = [];
 
   /**
    * Service-level toggle for dictionary enrichment.
@@ -71,7 +78,7 @@ class DatastoreTools {
   }
 
   /**
-   * Query a datastore resource with filters, sorting, pagination, and aggregation.
+   * Query a datastore resource: filter, sort, paginate, and aggregate.
    */
   public function queryDatastore(
     string $resourceId,
@@ -179,7 +186,10 @@ class DatastoreTools {
       );
     }
     catch (\Exception $e) {
-      $this->logger->error('MCP: Datastore query failed for @id: @error', ['@id' => $resourceId, '@error' => $e->getMessage()]);
+      $this->logger->error('Datastore query failed for @id: @error', [
+        '@id' => $resourceId,
+        '@error' => $e->getMessage(),
+      ]);
       return $this->buildErrorResponse($e, $resourceId);
     }
   }
@@ -192,7 +202,7 @@ class DatastoreTools {
    * ascending so repeated calls return the same rows.
    *
    * @param string $resourceId
-   *   Resource id in identifier__version form.
+   *   Resource ID in identifier__version format.
    * @param int $n
    *   Number of rows to return. Clamped to [1, 50].
    *
@@ -225,7 +235,7 @@ class DatastoreTools {
       ];
     }
     catch (\Throwable $e) {
-      $this->logger->error('MCP: Sample rows failed for @id: @error', [
+      $this->logger->error('Sample rows failed for @id: @error', [
         '@id' => $resourceId,
         '@error' => $e->getMessage(),
       ]);
@@ -241,7 +251,7 @@ class DatastoreTools {
    * exist.
    *
    * @param string $resourceId
-   *   Resource id in identifier__version form.
+   *   Resource ID in identifier__version format.
    * @param string $column
    *   Column name to enumerate.
    * @param int $limit
@@ -286,7 +296,7 @@ class DatastoreTools {
       ];
     }
     catch (\Throwable $e) {
-      $this->logger->error('MCP: Distinct values failed for @id.@col: @error', [
+      $this->logger->error('Distinct values failed for @id.@col: @error', [
         '@id' => $resourceId,
         '@col' => $column,
         '@error' => $e->getMessage(),
@@ -305,7 +315,7 @@ class DatastoreTools {
    * `dictionary_url` when a dictionary is resolved.
    *
    * @param string $resourceId
-   *   Resource id in identifier__version form.
+   *   Datastore resource ID (identifier__version) or a distribution UUID.
    * @param bool $includeDictionary
    *   When FALSE, skip the dictionary lookup (test/perf opt-out).
    */
@@ -496,6 +506,9 @@ class DatastoreTools {
 
   /**
    * Get import status for a datastore resource.
+   *
+   * @param string $resourceId
+   *   Resource ID in identifier__version format (from list_distributions).
    */
   public function getImportStatus(string $resourceId): array {
     try {
@@ -641,7 +654,10 @@ class DatastoreTools {
       );
     }
     catch (\Exception $e) {
-      $this->logger->error('MCP: Datastore join query failed for @id: @error', ['@id' => $resourceId, '@error' => $e->getMessage()]);
+      $this->logger->error('Datastore join query failed for @id: @error', [
+        '@id' => $resourceId,
+        '@error' => $e->getMessage(),
+      ]);
       return $this->buildErrorResponse($e, $resourceId);
     }
   }
@@ -736,6 +752,13 @@ class DatastoreTools {
 
   /**
    * Search column names/descriptions across all imported datastore resources.
+   *
+   * @param string $searchTerm
+   *   Column name or description substring to search (case-insensitive).
+   * @param string $searchIn
+   *   Where to search: "name", "description", or "both".
+   * @param int $limit
+   *   Max matches to return (default 100).
    */
   public function searchColumns(
     string $searchTerm,
@@ -859,13 +882,18 @@ class DatastoreTools {
       return $result;
     }
     catch (\Exception $e) {
-      $this->logger->error('MCP: Column search failed: @error', ['@error' => $e->getMessage()]);
+      $this->logger->error('Column search failed: @error', ['@error' => $e->getMessage()]);
       return ['error' => $e->getMessage()];
     }
   }
 
   /**
    * Get per-column statistics for a datastore resource.
+   *
+   * @param string $resourceId
+   *   Datastore resource ID (identifier__version) or a distribution UUID.
+   * @param string|null $columns
+   *   Comma-separated column names to analyze. Omit for all columns.
    */
   public function getDatastoreStats(string $resourceId, ?string $columns = NULL): array {
     try {
@@ -926,7 +954,10 @@ class DatastoreTools {
       ];
     }
     catch (\Throwable $e) {
-      $this->logger->error('MCP: Stats query failed for @id: @error', ['@id' => $resourceId, '@error' => $e->getMessage()]);
+      $this->logger->error('Stats query failed for @id: @error', [
+        '@id' => $resourceId,
+        '@error' => $e->getMessage(),
+      ]);
       return ['error' => $e->getMessage()];
     }
   }
@@ -1314,7 +1345,7 @@ class DatastoreTools {
    * column name if found, NULL otherwise.
    */
   protected function extractUnknownColumn(string $message): ?string {
-    // MySQL: "SQLSTATE[42S22]: Column not found: 1054 Unknown column 'foo' in 'field list'"
+    // MySQL form, e.g. "Unknown column 'foo' in 'field list'".
     if (preg_match("/Unknown column ['\"`]([^'\"`]+)['\"`]/i", $message, $m)) {
       return $m[1];
     }
@@ -1397,7 +1428,14 @@ class DatastoreTools {
   }
 
   /**
-   * Parse a resource_id string into [identifier, version].
+   * Parse or resolve a resource ID into [identifier, version].
+   *
+   * Accepts a datastore resource ID in identifier__version format, or a bare
+   * distribution UUID — mirroring DKAN's /api/1/datastore/query/{identifier}
+   * route, which accepts either. A bare UUID is resolved to its underlying
+   * identifier__version by reading the distribution's %Ref:downloadURL. When
+   * resolution fails the input is returned as-is ([identifier, NULL]) so a
+   * true bare identifier keeps its prior behavior. Per-instance memoized.
    *
    * @return array{string, string|null}
    *   The identifier and version.
@@ -1407,7 +1445,36 @@ class DatastoreTools {
       $parts = explode('__', $resourceId, 2);
       return [$parts[0], $parts[1]];
     }
-    return [$resourceId, NULL];
+    if (array_key_exists($resourceId, $this->resourceIdCache)) {
+      return $this->resourceIdCache[$resourceId];
+    }
+    return $this->resourceIdCache[$resourceId]
+      = $this->resolveDistributionUuid($resourceId) ?? [$resourceId, NULL];
+  }
+
+  /**
+   * Resolve a distribution UUID to [identifier, version] via the metastore.
+   *
+   * @return array{string, string}|null
+   *   The resource identifier and version, or NULL when the UUID is not a
+   *   distribution or has no resource reference.
+   */
+  protected function resolveDistributionUuid(string $uuid): ?array {
+    try {
+      $distribution = $this->metastore->get('distribution', $uuid);
+    }
+    catch (\Throwable) {
+      return NULL;
+    }
+    $data = json_decode((string) $distribution);
+    if (!is_object($data) || !isset($data->data->{'%Ref:downloadURL'}[0]->data)) {
+      return NULL;
+    }
+    $ref = $data->data->{'%Ref:downloadURL'}[0]->data;
+    if (empty($ref->identifier) || !isset($ref->version)) {
+      return NULL;
+    }
+    return [(string) $ref->identifier, (string) $ref->version];
   }
 
 }

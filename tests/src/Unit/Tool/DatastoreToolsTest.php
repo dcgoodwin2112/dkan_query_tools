@@ -2,15 +2,15 @@
 
 namespace Drupal\Tests\dkan_query_tools\Unit\Tool;
 
-use Drupal\common\DatasetInfo;
-use Drupal\common\Storage\DatabaseTableInterface;
+use Drupal\dkan_common\DatasetInfo;
+use Drupal\dkan_common\Storage\DatabaseTableInterface;
 use Drupal\Core\Database\Connection;
 use Drupal\Core\Database\StatementInterface;
 use Drupal\Core\Database\Query\SelectInterface;
-use Drupal\datastore\DatastoreService;
-use Drupal\datastore\Service\Query;
+use Drupal\dkan_datastore\DatastoreService;
+use Drupal\dkan_datastore\Service\Query;
 use Drupal\dkan_query_tools\Tool\DatastoreTools;
-use Drupal\metastore\MetastoreService;
+use Drupal\dkan_metastore\MetastoreService;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\NullLogger;
 use RootedData\RootedJsonData;
@@ -2151,6 +2151,58 @@ class DatastoreToolsTest extends TestCase {
     $decoded = json_decode($captured, TRUE);
     $this->assertSame('=', $decoded['conditions'][0]['operator']);
     $this->assertSame('Smith &amp; Jones', $decoded['conditions'][0]['value']);
+  }
+
+  public function testResolvesBareDistributionUuid(): void {
+    $distribution = new RootedJsonData(json_encode([
+      'data' => [
+        '%Ref:downloadURL' => [
+          ['data' => ['identifier' => 'abc', 'version' => '5']],
+        ],
+      ],
+    ]));
+    $metastore = $this->createMock(MetastoreService::class);
+    $metastore->expects($this->once())
+      ->method('get')
+      ->with('distribution', 'dist-uuid')
+      ->willReturn($distribution);
+
+    $storage = $this->createMock(DatabaseTableInterface::class);
+    $storage->method('getSchema')->willReturn([
+      'fields' => [
+        'record_number' => ['type' => 'serial'],
+        'state' => ['type' => 'varchar'],
+      ],
+    ]);
+    $datastore = $this->createMock(DatastoreService::class);
+    $datastore->expects($this->once())
+      ->method('getStorage')
+      ->with('abc', '5')
+      ->willReturn($storage);
+
+    $tools = $this->createTools(datastore: $datastore, metastore: $metastore);
+    $result = $tools->getDatastoreSchema('dist-uuid', FALSE);
+
+    $this->assertSame('dist-uuid', $result['resource_id']);
+    $this->assertCount(1, $result['columns']);
+    $this->assertSame('state', $result['columns'][0]['name']);
+  }
+
+  public function testBareIdFallsBackWhenNotDistribution(): void {
+    $metastore = $this->createMock(MetastoreService::class);
+    $metastore->method('get')->willThrowException(new \Exception('not found'));
+
+    $storage = $this->createMock(DatabaseTableInterface::class);
+    $storage->method('getSchema')->willReturn(['fields' => ['x' => ['type' => 'int']]]);
+    $datastore = $this->createMock(DatastoreService::class);
+    $datastore->expects($this->once())
+      ->method('getStorage')
+      ->with('bare-id', NULL)
+      ->willReturn($storage);
+
+    $tools = $this->createTools(datastore: $datastore, metastore: $metastore);
+    $result = $tools->getDatastoreSchema('bare-id', FALSE);
+    $this->assertSame('bare-id', $result['resource_id']);
   }
 
 }
