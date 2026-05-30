@@ -2,9 +2,9 @@
 
 namespace Drupal\Tests\dkan_query_tools\Unit\Tool;
 
-use Drupal\common\DatasetInfo;
+use Drupal\dkan_common\DatasetInfo;
 use Drupal\dkan_query_tools\Tool\MetastoreTools;
-use Drupal\metastore\MetastoreService;
+use Drupal\dkan_metastore\MetastoreService;
 use PHPUnit\Framework\TestCase;
 use RootedData\RootedJsonData;
 

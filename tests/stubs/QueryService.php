@@ -1,11 +1,11 @@
 <?php
 
-namespace Drupal\datastore\Service;
+namespace Drupal\dkan_datastore\Service;
 
 use RootedData\RootedJsonData;
 
 /**
- * Stub for Drupal\datastore\Service\Query.
+ * Stub for Drupal\dkan_datastore\Service\Query.
  */
 class Query {
 

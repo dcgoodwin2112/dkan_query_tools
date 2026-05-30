@@ -2,8 +2,8 @@
 
 namespace Drupal\dkan_query_tools\Tool;
 
-use Drupal\common\DatasetInfo;
-use Drupal\metastore\MetastoreService;
+use Drupal\dkan_common\DatasetInfo;
+use Drupal\dkan_metastore\MetastoreService;
 
 /**
  * Tools for DKAN metastore operations.
@@ -17,6 +17,11 @@ class MetastoreTools {
 
   /**
    * List dataset summaries with pagination.
+   *
+   * @param int $offset
+   *   Number of datasets to skip.
+   * @param int $limit
+   *   Max datasets to return (1-100).
    */
   public function listDatasets(int $offset = 0, int $limit = 25): array {
     $limit = min(max($limit, 1), 100);
@@ -50,6 +55,9 @@ class MetastoreTools {
 
   /**
    * Get full dataset metadata by UUID.
+   *
+   * @param string $identifier
+   *   Dataset UUID.
    */
   public function getDataset(string $identifier): array {
     try {
@@ -64,6 +72,9 @@ class MetastoreTools {
 
   /**
    * List distributions for a dataset.
+   *
+   * @param string $datasetId
+   *   Dataset UUID.
    */
   public function listDistributions(string $datasetId): array {
     try {
@@ -110,6 +121,9 @@ class MetastoreTools {
 
   /**
    * Get distribution metadata by UUID.
+   *
+   * @param string $identifier
+   *   Distribution UUID.
    */
   public function getDistribution(string $identifier): array {
     try {
@@ -152,6 +166,9 @@ class MetastoreTools {
 
   /**
    * Get a JSON Schema definition by schema ID.
+   *
+   * @param string $schemaId
+   *   Schema ID (e.g. dataset, distribution, keyword).
    */
   public function getSchema(string $schemaId): array {
     try {
@@ -193,6 +210,9 @@ class MetastoreTools {
    * Known limitation: only finds dictionaries linked on inline distributions
    * (the DCAT-flat shape DKAN currently stores). Dictionaries linked via
    * standalone `distribution` metastore items would require a separate walk.
+   *
+   * @param string $datasetOrResourceId
+   *   Dataset UUID or resource ID in identifier__version format.
    *
    * @return array
    *   ['dictionaries' => [resource_id => entry]] or ['error' => message]
@@ -320,6 +340,9 @@ class MetastoreTools {
 
   /**
    * Get aggregated dataset info: distributions, resources, import status.
+   *
+   * @param string $uuid
+   *   Dataset UUID.
    */
   public function getDatasetInfo(string $uuid): array {
     try {

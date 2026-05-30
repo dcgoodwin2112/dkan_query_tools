@@ -1,11 +1,11 @@
 <?php
 
-namespace Drupal\metastore;
+namespace Drupal\dkan_metastore;
 
 use RootedData\RootedJsonData;
 
 /**
- * Stub for Drupal\metastore\MetastoreService.
+ * Stub for Drupal\dkan_metastore\MetastoreService.
  */
 class MetastoreService {
 
