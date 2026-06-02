@@ -35,8 +35,8 @@ class MetastoreTools {
       $items[] = [
         'identifier' => $data->identifier ?? NULL,
         'title' => $data->title ?? NULL,
-        'description' => isset($data->description) ? mb_substr($data->description, 0, 200) : NULL,
-        'distributions' => isset($data->distribution) ? count($data->distribution) : 0,
+        'description' => isset($data->description) && is_scalar($data->description) ? mb_substr((string) $data->description, 0, 200) : NULL,
+        'distributions' => is_countable($data->distribution ?? NULL) ? count($data->distribution) : 0,
       ];
     }
 
@@ -154,8 +154,8 @@ class MetastoreTools {
     // Truncate descriptions and strip verbose fields to reduce token usage.
     if (isset($data['dataset'])) {
       foreach ($data['dataset'] as &$dataset) {
-        if (isset($dataset['description'])) {
-          $dataset['description'] = mb_substr($dataset['description'], 0, 200);
+        if (isset($dataset['description']) && is_scalar($dataset['description'])) {
+          $dataset['description'] = mb_substr((string) $dataset['description'], 0, 200);
         }
         unset($dataset['spatial']);
       }

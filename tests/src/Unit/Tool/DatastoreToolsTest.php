@@ -782,12 +782,31 @@ class DatastoreToolsTest extends TestCase {
     // Missing required fields.
     $result = $tools->queryDatastore('test', expressions: '[{"operator":"sum"}]');
     $this->assertArrayHasKey('error', $result);
-    $this->assertStringContainsString('operator, operands, and alias', $result['error']);
+    $this->assertStringContainsString('string operator', $result['error']);
 
     // Invalid operator.
     $result = $tools->queryDatastore('test', expressions: '[{"operator":"invalid","operands":["col"],"alias":"a"}]');
     $this->assertArrayHasKey('error', $result);
     $this->assertStringContainsString('Invalid operator', $result['error']);
+  }
+
+  public function testQueryDatastoreRejectsMalformedExpressionTypes(): void {
+    $tools = $this->createTools();
+
+    // Wrong-typed fields from decoded JSON must return a structured error, not
+    // throw (e.g. count() on a scalar operands, or array access on a scalar).
+    foreach ([
+      '[{"operator":"sum","operands":"col","alias":"a"}]',
+      '[{"operator":"sum","operands":5,"alias":"a"}]',
+      '[{"operator":["sum"],"operands":["col"],"alias":"a"}]',
+      '[{"operator":"sum","operands":["col"],"alias":["a"]}]',
+      '["just a string"]',
+      '[5]',
+    ] as $expressions) {
+      $result = $tools->queryDatastore('test', expressions: $expressions);
+      $this->assertArrayHasKey('error', $result, "Expected error for expressions: $expressions");
+      $this->assertStringContainsString('string operator', $result['error']);
+    }
   }
 
   public function testQueryDatastoreAliasConflict(): void {
@@ -1072,6 +1091,74 @@ class DatastoreToolsTest extends TestCase {
     $this->assertArrayNotHasKey('error', $result);
   }
 
+  public function testQueryDatastoreJoinJsonUnqualifiedRightDefaultsToJoined(): void {
+    $queryResult = new RootedJsonData('{"results":[],"count":0}');
+    $queryService = $this->createMock(Query::class);
+    $queryService->method('runQuery')->willReturnCallback(function ($datastoreQuery) use ($queryResult) {
+      $join = json_decode((string) $datastoreQuery, TRUE)['joins'][0];
+      // An unqualified JSON right column must resolve to the joined resource
+      // 'j' (a t->j join), not self-join the primary 't'.
+      $this->assertSame('j', $join['resource']);
+      $this->assertSame('t', $join['condition']['resource']);
+      $this->assertSame('id', $join['condition']['property']);
+      $this->assertSame(['resource' => 'j', 'property' => 'id'], $join['condition']['value']);
+
+      return $queryResult;
+    });
+
+    $tools = $this->createTools(query: $queryService);
+    $joinOn = json_encode(['left' => 'id', 'right' => 'id']);
+    $result = $tools->queryDatastoreJoin('res1__1', 'res2__1', $joinOn);
+
+    $this->assertArrayNotHasKey('error', $result);
+  }
+
+  public function testQueryDatastoreJoinJsonOperatorPassedThrough(): void {
+    $queryService = $this->createMock(Query::class);
+    $queryService->method('runQuery')->willReturnCallback(function ($datastoreQuery) {
+      $join = json_decode((string) $datastoreQuery, TRUE)['joins'][0];
+      // The documented non-equality operator must reach the join condition,
+      // and "like" must be normalized to DKAN's case-sensitive LIKE.
+      $this->assertSame('LIKE', $join['condition']['operator']);
+      return new RootedJsonData('{"results":[],"count":0}');
+    });
+
+    $tools = $this->createTools(query: $queryService);
+    $joinOn = json_encode(['left' => 't.name', 'right' => 'j.name', 'operator' => 'like']);
+    $result = $tools->queryDatastoreJoin('res1__1', 'res2__1', $joinOn);
+
+    $this->assertArrayNotHasKey('error', $result);
+  }
+
+  public function testQueryDatastoreJoinJsonInvalidOperatorReturnsError(): void {
+    $tools = $this->createTools();
+    foreach (['foo', 'DROP', '; --', ['>'], 5] as $op) {
+      $joinOn = json_encode(['left' => 't.a', 'right' => 'j.b', 'operator' => $op]);
+      $result = $tools->queryDatastoreJoin('res1__1', 'res2__1', $joinOn);
+      $this->assertArrayHasKey('error', $result, "Expected error for operator: " . json_encode($op));
+      $this->assertStringContainsString('Invalid join operator', $result['error']);
+    }
+  }
+
+  public function testQueryDatastoreJoinCrossQualifiedJoinsSecondResource(): void {
+    $queryService = $this->createMock(Query::class);
+    $queryService->method('runQuery')->willReturnCallback(function ($datastoreQuery) {
+      $join = json_decode((string) $datastoreQuery, TRUE)['joins'][0];
+      // "j.x=t.y": the join must still attach the second resource 'j', not
+      // re-join the primary 't' under its own alias.
+      $this->assertSame('j', $join['resource']);
+      $this->assertSame('j', $join['condition']['resource']);
+      $this->assertSame('x', $join['condition']['property']);
+      $this->assertSame(['resource' => 't', 'property' => 'y'], $join['condition']['value']);
+      return new RootedJsonData('{"results":[],"count":0}');
+    });
+
+    $tools = $this->createTools(query: $queryService);
+    $result = $tools->queryDatastoreJoin('res1__1', 'res2__1', 'j.x=t.y');
+
+    $this->assertArrayNotHasKey('error', $result);
+  }
+
   public function testQueryDatastoreJoinInvalidJoinOn(): void {
     $tools = $this->createTools();
 
@@ -1088,6 +1175,23 @@ class DatastoreToolsTest extends TestCase {
     $result = $tools->queryDatastoreJoin('res1__1', 'res2__1', '{bad json}');
     $this->assertArrayHasKey('error', $result);
     $this->assertStringContainsString('Invalid JSON join_on', $result['error']);
+  }
+
+  public function testQueryDatastoreJoinRejectsNonStringJsonSides(): void {
+    $tools = $this->createTools();
+
+    // left/right as a JSON array or number must return a structured error,
+    // not throw an uncaught TypeError from parseQualifiedField(string).
+    foreach ([
+      '{"left":["a","b"],"right":"j.col"}',
+      '{"left":5,"right":"j.col"}',
+      '{"left":"t.col","right":{"x":1}}',
+      '{"left":true,"right":"j.col"}',
+    ] as $joinOn) {
+      $result = $tools->queryDatastoreJoin('res1__1', 'res2__1', $joinOn);
+      $this->assertArrayHasKey('error', $result, "Expected error for join_on: $joinOn");
+      $this->assertStringContainsString('Invalid JSON join_on', $result['error']);
+    }
   }
 
   public function testQueryDatastoreJoinSortWithAlias(): void {
@@ -1265,7 +1369,7 @@ class DatastoreToolsTest extends TestCase {
     $joinOn = json_encode(['left' => 't.col']);
     $result = $tools->queryDatastoreJoin('res1__1', 'res2__1', $joinOn);
     $this->assertArrayHasKey('error', $result);
-    $this->assertStringContainsString('must have "left" and "right"', $result['error']);
+    $this->assertStringContainsString('non-empty string "left" and "right"', $result['error']);
   }
 
   /**
@@ -1276,7 +1380,7 @@ class DatastoreToolsTest extends TestCase {
     $joinOn = json_encode(['right' => 'j.col']);
     $result = $tools->queryDatastoreJoin('res1__1', 'res2__1', $joinOn);
     $this->assertArrayHasKey('error', $result);
-    $this->assertStringContainsString('must have "left" and "right"', $result['error']);
+    $this->assertStringContainsString('non-empty string "left" and "right"', $result['error']);
   }
 
   /**
@@ -1855,7 +1959,7 @@ class DatastoreToolsTest extends TestCase {
     $this->assertArrayHasKey('error', $result);
   }
 
-  public function testDistinctValuesFiltersNulls(): void {
+  public function testDistinctValuesExcludesNullsViaSqlAndKeepsEmptyStrings(): void {
     $storage = $this->createMock(DatabaseTableInterface::class);
     $storage->method('getSchema')->willReturn([
       'fields' => [
@@ -1867,8 +1971,10 @@ class DatastoreToolsTest extends TestCase {
     $datastore = $this->createMock(DatastoreService::class);
     $datastore->method('getStorage')->willReturn($storage);
 
+    // NULLs are excluded in SQL (IS NOT NULL), so the rows returned are the
+    // non-null distinct values; empty strings are real values and are kept.
     $statement = $this->createMock(StatementInterface::class);
-    $statement->method('fetchCol')->willReturn([NULL, 'CA', '', 'TX']);
+    $statement->method('fetchCol')->willReturn(['CA', '', 'TX']);
 
     $select = $this->createMock(SelectInterface::class);
     $select->method('addField')->willReturnSelf();
@@ -1876,6 +1982,11 @@ class DatastoreToolsTest extends TestCase {
     $select->method('orderBy')->willReturnSelf();
     $select->method('range')->willReturnSelf();
     $select->method('execute')->willReturn($statement);
+    // The NULL exclusion must happen at the query layer.
+    $select->expects($this->once())
+      ->method('isNotNull')
+      ->with('t.state')
+      ->willReturnSelf();
 
     $database = $this->createMock(Connection::class);
     $database->method('select')->willReturn($select);
@@ -1883,8 +1994,8 @@ class DatastoreToolsTest extends TestCase {
     $tools = $this->createTools(datastore: $datastore, database: $database);
     $result = $tools->distinctValues('abc__1', 'state');
 
-    // NULL filtered out, empty string kept.
     $this->assertEquals(['CA', '', 'TX'], $result['values']);
+    $this->assertSame(3, $result['value_count']);
   }
 
   public function testGetDatastoreStatsAllColumns(): void {

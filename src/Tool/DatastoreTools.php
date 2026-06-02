@@ -278,18 +278,20 @@ class DatastoreTools {
       }
       $tableName = $storage->getTableName();
 
-      // Fetch limit+1 to detect truncation.
+      // Fetch limit+1 to detect truncation. Exclude NULLs in SQL (empty strings
+      // are kept — they are real distinct values) so the truncation flag and the
+      // returned value count are computed over the same non-null set rather than
+      // diverging when a NULL occupies the +1 boundary row.
       $query = $this->database->select($tableName, 't');
       $query->addField('t', $column, 'value');
       $query->distinct();
+      $query->isNotNull('t.' . $column);
       $query->orderBy('value', 'ASC');
       $query->range(0, $limit + 1);
       $rows = $query->execute()->fetchCol();
 
       $truncated = count($rows) > $limit;
-      $values = array_slice($rows, 0, $limit);
-      // Drop NULLs but keep empty strings (they are real distinct values).
-      $values = array_values(array_filter($values, static fn($v) => $v !== NULL));
+      $values = array_values(array_slice($rows, 0, $limit));
 
       return [
         'resource_id' => $resourceId,
@@ -764,19 +766,38 @@ class DatastoreTools {
     // JSON format: {"left":"t.col","right":"j.col","operator":"="}.
     if (str_starts_with($trimmed, '{')) {
       $parsed = json_decode($trimmed, TRUE);
-      if (!is_array($parsed) || empty($parsed['left']) || empty($parsed['right'])) {
-        return ['error' => 'Invalid JSON join_on: must have "left" and "right" fields (e.g., {"left":"t.col","right":"j.col","operator":"="}).'];
+      // left/right must be non-empty strings: a JSON array/object/number would
+      // otherwise reach parseQualifiedField(string) and throw an uncaught
+      // TypeError (this runs before the query try/catch below).
+      if (!is_array($parsed)
+        || empty($parsed['left']) || !is_string($parsed['left'])
+        || empty($parsed['right']) || !is_string($parsed['right'])) {
+        return ['error' => 'Invalid JSON join_on: must have non-empty string "left" and "right" fields (e.g., {"left":"t.col","right":"j.col","operator":"="}).'];
       }
-      $left = $this->parseQualifiedField($parsed['left']);
-      $right = $this->parseQualifiedField($parsed['right']);
-      return [
-        'resource' => $right['resource'] ?? 'j',
-        'condition' => [
-          'resource' => $left['resource'] ?? 't',
-          'property' => $left['property'],
-          'value' => $right,
-        ],
+      $left = $this->qualifyJoinField($parsed['left'], 't');
+      $right = $this->qualifyJoinField($parsed['right'], 'j');
+
+      $condition = [
+        'resource' => $left['resource'],
+        'property' => $left['property'],
+        'value' => $right,
       ];
+
+      // Optional non-equality operator. DKAN supports =, !=, <>, <, <=, >, >=,
+      // like for join conditions; without this the documented "operator" field
+      // was silently dropped and every join ran as equality.
+      if (isset($parsed['operator']) && $parsed['operator'] !== '' && $parsed['operator'] !== '=') {
+        $op = is_string($parsed['operator']) ? $this->normalizeJoinOperator($parsed['operator']) : NULL;
+        if ($op === NULL) {
+          return ['error' => 'Invalid join operator. Valid operators: =, !=, <>, <, <=, >, >=, like.'];
+        }
+        $condition['operator'] = $op;
+      }
+
+      // A two-resource join always attaches the joined resource 'j'; the
+      // condition carries the t/j relationship. (Deriving this from the right
+      // side mis-joined when the right was qualified to 't', e.g. "j.x=t.y".)
+      return ['resource' => 'j', 'condition' => $condition];
     }
 
     // Simple format: "col1=col2".
@@ -792,24 +813,54 @@ class DatastoreTools {
       return ['error' => 'Invalid join_on: both sides of "=" must be non-empty.'];
     }
 
-    // Parse qualified fields (e.g., "t.state=j.state") with defaults.
-    $left = $this->parseQualifiedField($leftCol);
-    if (!isset($left['resource']) || $left['resource'] === 't' && !str_contains($leftCol, '.')) {
-      $left['resource'] = 't';
-    }
-    $right = $this->parseQualifiedField($rightCol);
-    if (!isset($right['resource']) || $right['resource'] === 't' && !str_contains($rightCol, '.')) {
-      $right['resource'] = 'j';
-    }
+    // Unqualified columns default to left→primary 't', right→joined 'j'.
+    $left = $this->qualifyJoinField($leftCol, 't');
+    $right = $this->qualifyJoinField($rightCol, 'j');
 
     return [
-      'resource' => $right['resource'],
+      'resource' => 'j',
       'condition' => [
         'resource' => $left['resource'],
         'property' => $left['property'],
         'value' => $right,
       ],
     ];
+  }
+
+  /**
+   * Parse a join field, defaulting an unqualified column to the given resource.
+   *
+   * @param string $field
+   *   Field as "alias.column" or a bare "column".
+   * @param string $defaultResource
+   *   Resource alias to use when the field carries no "alias." prefix.
+   *
+   * @return array{resource: string, property: string}
+   *   Resolved resource alias and property.
+   */
+  protected function qualifyJoinField(string $field, string $defaultResource): array {
+    $parsed = $this->parseQualifiedField($field);
+    if (!str_contains($field, '.')) {
+      $parsed['resource'] = $defaultResource;
+    }
+    return $parsed;
+  }
+
+  /**
+   * Normalize a join operator to a DKAN-accepted form, or NULL if invalid.
+   *
+   * DKAN's SelectFactory::safeJoinOperator accepts =, !=, <>, >, >=, <, <=, and
+   * (case-sensitive) LIKE. Symbols pass through; "like" is upper-cased.
+   */
+  protected function normalizeJoinOperator(string $operator): ?string {
+    $symbols = ['=', '!=', '<>', '>', '>=', '<', '<='];
+    if (in_array($operator, $symbols, TRUE)) {
+      return $operator;
+    }
+    if (strtolower($operator) === 'like') {
+      return 'LIKE';
+    }
+    return NULL;
   }
 
   /**
@@ -1017,10 +1068,16 @@ class DatastoreTools {
       $query->addExpression('COUNT(*)', 'total_rows');
 
       foreach (array_keys($fields) as $col) {
-        $query->addExpression("COUNT(\"$col\")", "{$col}__non_null");
-        $query->addExpression("COUNT(DISTINCT \"$col\")", "{$col}__distinct");
-        $query->addExpression("MIN(\"$col\")", "{$col}__min");
-        $query->addExpression("MAX(\"$col\")", "{$col}__max");
+        // Quote the identifier with the driver's identifier-quote char
+        // (backticks on default MySQL). Hardcoded double quotes are treated as
+        // a string literal unless ANSI_QUOTES is set, which would make every
+        // aggregate operate on a constant. escapeField also strips any char
+        // outside [A-Za-z0-9_.]; $col is already schema-validated above.
+        $field = $this->database->escapeField($col);
+        $query->addExpression("COUNT($field)", "{$col}__non_null");
+        $query->addExpression("COUNT(DISTINCT $field)", "{$col}__distinct");
+        $query->addExpression("MIN($field)", "{$col}__min");
+        $query->addExpression("MAX($field)", "{$col}__max");
       }
 
       $row = $query->execute()->fetchAssoc();
@@ -1072,8 +1129,14 @@ class DatastoreTools {
 
     $expressions = [];
     foreach ($parsed as $expr) {
-      if (empty($expr['operator']) || empty($expr['operands']) || empty($expr['alias'])) {
-        return ['error' => 'Each expression must have operator, operands, and alias fields.'];
+      // Validate types from the decoded JSON before any use: a non-array $expr,
+      // a non-string operator/alias, or a non-array operands would otherwise
+      // throw (e.g. count() on a scalar) outside the query try/catch.
+      if (!is_array($expr)
+        || empty($expr['operator']) || !is_string($expr['operator'])
+        || empty($expr['operands']) || !is_array($expr['operands'])
+        || empty($expr['alias']) || !is_string($expr['alias'])) {
+        return ['error' => 'Each expression must have a string operator, a non-empty operands array, and a string alias.'];
       }
       if (!in_array($expr['operator'], $validOperators, TRUE)) {
         return ['error' => 'Invalid operator "' . $expr['operator'] . '". Valid operators: ' . implode(', ', $validOperators)];
@@ -1325,13 +1388,13 @@ class DatastoreTools {
   protected function canonicalizeConditionProperties(array $conditions, string $resourceId): array {
     $properties = [];
     foreach ($conditions as $cond) {
-      if (is_array($cond) && isset($cond['property'])) {
-        $properties[] = (string) $cond['property'];
+      if (is_array($cond) && isset($cond['property']) && is_string($cond['property'])) {
+        $properties[] = $cond['property'];
       }
       if (is_array($cond) && isset($cond['conditions']) && is_array($cond['conditions'])) {
         foreach ($cond['conditions'] as $sub) {
-          if (is_array($sub) && isset($sub['property'])) {
-            $properties[] = (string) $sub['property'];
+          if (is_array($sub) && isset($sub['property']) && is_string($sub['property'])) {
+            $properties[] = $sub['property'];
           }
         }
       }
@@ -1343,13 +1406,13 @@ class DatastoreTools {
     $map = array_combine($properties, $canonical);
     $out = [];
     foreach ($conditions as $cond) {
-      if (is_array($cond) && isset($cond['property']) && isset($map[$cond['property']])) {
+      if (is_array($cond) && isset($cond['property']) && is_string($cond['property']) && isset($map[$cond['property']])) {
         $cond['property'] = $map[$cond['property']];
       }
       if (is_array($cond) && isset($cond['conditions']) && is_array($cond['conditions'])) {
         $sub = [];
         foreach ($cond['conditions'] as $c) {
-          if (is_array($c) && isset($c['property']) && isset($map[$c['property']])) {
+          if (is_array($c) && isset($c['property']) && is_string($c['property']) && isset($map[$c['property']])) {
             $c['property'] = $map[$c['property']];
           }
           $sub[] = $c;

@@ -15,6 +15,8 @@ interface SelectInterface {
 
   public function orderBy(string $field, string $direction = 'ASC'): SelectInterface;
 
+  public function isNotNull(string $field): SelectInterface;
+
   public function range(?int $start = NULL, ?int $length = NULL): SelectInterface;
 
   public function execute(): StatementInterface;

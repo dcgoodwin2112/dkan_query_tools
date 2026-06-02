@@ -23,5 +23,4 @@ services:
   dkan_query_tools.search:
     class: Drupal\dkan_query_tools\Tool\SearchTools
     arguments:
-      - '@http_client'
-      - '@request_stack'
+      - !service_closure '@dkan.metastore_search.service'
