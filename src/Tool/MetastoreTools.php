@@ -25,6 +25,7 @@ class MetastoreTools {
    */
   public function listDatasets(int $offset = 0, int $limit = 25): array {
     $limit = min(max($limit, 1), 100);
+    $offset = max($offset, 0);
     $datasets = $this->metastore->getAll('dataset', $offset, $limit);
     $total = $this->metastore->count('dataset');
 

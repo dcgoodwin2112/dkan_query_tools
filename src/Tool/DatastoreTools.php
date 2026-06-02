@@ -6,8 +6,10 @@ use Drupal\dkan_common\DatasetInfo;
 use Drupal\Core\Database\Connection;
 use Drupal\dkan_datastore\DatastoreService;
 use Drupal\dkan_datastore\Service\DatastoreQuery;
+use Drupal\dkan_datastore\Service\Info\ImportInfo;
 use Drupal\dkan_datastore\Service\Query;
 use Drupal\dkan_metastore\MetastoreService;
+use Procrastinator\Result;
 use Psr\Log\LoggerInterface;
 
 /**
@@ -61,6 +63,7 @@ class DatastoreTools {
     protected DatasetInfo $datasetInfo,
     protected Connection $database,
     protected LoggerInterface $logger,
+    protected ?ImportInfo $importInfo = NULL,
   ) {}
 
   /**
@@ -93,6 +96,7 @@ class DatastoreTools {
     int $maxLimit = 500,
   ): array {
     $limit = min(max($limit, 1), max(1, $maxLimit));
+    $offset = max($offset, 0);
 
     $query = [
       'resources' => [['id' => $resourceId, 'alias' => 't']],
@@ -511,20 +515,105 @@ class DatastoreTools {
    *   Resource ID in identifier__version format (from list_distributions).
    */
   public function getImportStatus(string $resourceId): array {
+    // Row/column counts come from the datastore summary; a thrown summary means
+    // no datastore table exists for this resource yet.
+    $numOfRows = NULL;
+    $numOfColumns = NULL;
+    $tableExists = FALSE;
+    $summaryError = NULL;
     try {
       $summary = $this->datastoreService->summary($resourceId);
       $numOfRows = is_object($summary) ? ($summary->numOfRows ?? 0) : ($summary['numOfRows'] ?? 0);
       $numOfColumns = is_object($summary) ? ($summary->numOfColumns ?? 0) : ($summary['numOfColumns'] ?? 0);
-      return [
-        'resource_id' => $resourceId,
-        'status' => $numOfRows > 0 ? 'done' : 'pending',
-        'num_of_rows' => $numOfRows,
-        'num_of_columns' => $numOfColumns,
-      ];
+      $tableExists = TRUE;
     }
-    catch (\Exception $e) {
-      return ['resource_id' => $resourceId, 'status' => 'not_imported', 'error' => $e->getMessage()];
+    catch (\Throwable $e) {
+      $summaryError = $e->getMessage();
     }
+
+    $state = $this->resolveImportState($resourceId, $tableExists);
+
+    $result = [
+      'resource_id' => $resourceId,
+      'status' => $state['status'],
+      'num_of_rows' => $numOfRows,
+      'num_of_columns' => $numOfColumns,
+    ];
+    if (isset($state['error'])) {
+      $result['error'] = $state['error'];
+    }
+    elseif ($state['status'] === 'not_imported' && $summaryError !== NULL) {
+      $result['error'] = $summaryError;
+    }
+    return $result;
+  }
+
+  /**
+   * Resolve a normalized import status for a resource.
+   *
+   * Prefers DKAN's authoritative importer job state (via ImportInfo) so a
+   * completed import is reported "done" regardless of row count — a header-only
+   * (zero-row) CSV import is a valid, completed datastore table, not "pending".
+   *
+   * Both pipeline stages are consulted. The datastore import queues only after
+   * the file fetcher finishes, so a fetcher that is done or running while the
+   * importer still reads WAITING means datastore work is queued/imminent —
+   * "pending", not "not_imported" (a queued deferred import) and not "done" (a
+   * queued re-import over an older table). Only when neither stage has started
+   * (fetcher WAITING) is the resource genuinely un-queued, and the state is
+   * resolved from table existence.
+   *
+   * When ImportInfo is unavailable (e.g. unit tests with no version), falls
+   * back to datastore-table existence rather than row count.
+   *
+   * @param string $resourceId
+   *   Resource ID, ideally in identifier__version format.
+   * @param bool $tableExists
+   *   Whether a datastore table currently exists for the resource.
+   *
+   * @return array{status: string, error?: string}
+   *   Normalized status (done|pending|error|not_imported) and optional error.
+   */
+  protected function resolveImportState(string $resourceId, bool $tableExists): array {
+    [$identifier, $version] = $this->parseResourceId($resourceId);
+
+    if ($this->importInfo !== NULL && $version !== NULL) {
+      try {
+        $item = $this->importInfo->getItem($identifier, (string) $version);
+        $importer = $item->importerStatus ?? NULL;
+        $fetcher = $item->fileFetcherStatus ?? NULL;
+
+        // Terminal importer states are authoritative.
+        if ($importer === Result::DONE) {
+          return ['status' => 'done'];
+        }
+        if ($importer === Result::ERROR) {
+          return ['status' => 'error', 'error' => $item->importerError ?: 'Import failed.'];
+        }
+        // Datastore import actively running (or partially run, will resume).
+        if ($importer === Result::IN_PROGRESS || $importer === Result::STOPPED) {
+          return ['status' => 'pending'];
+        }
+        // Importer still WAITING: look at the fetch stage. A failed fetch is a
+        // hard error; a fetch that is running or already done means the
+        // datastore import is queued or imminent — pending, regardless of any
+        // older table.
+        if ($fetcher === Result::ERROR) {
+          return ['status' => 'error', 'error' => 'File fetch failed before datastore import.'];
+        }
+        if ($fetcher === Result::IN_PROGRESS || $fetcher === Result::DONE) {
+          return ['status' => 'pending'];
+        }
+        // Neither stage has started: not queued. Resolve from table existence.
+        return ['status' => $tableExists ? 'done' : 'not_imported'];
+      }
+      catch (\Throwable) {
+        // Fall through to the storage-based heuristic below.
+      }
+    }
+
+    // Fallback: storage existence, not row count.
+    return ['status' => $tableExists ? 'done' : 'not_imported'];
   }
 
   /**
@@ -545,6 +634,7 @@ class DatastoreTools {
     int $maxLimit = 500,
   ): array {
     $limit = min(max($limit, 1), max(1, $maxLimit));
+    $offset = max($offset, 0);
 
     $query = [
       'resources' => [
@@ -774,6 +864,8 @@ class DatastoreTools {
     if ($searchTerm === '') {
       return ['error' => 'search_term cannot be empty.'];
     }
+
+    $limit = min(max($limit, 1), 500);
 
     try {
       $matches = [];

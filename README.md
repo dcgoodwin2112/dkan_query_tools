@@ -46,7 +46,7 @@ Provides three Drupal services that wrap DKAN's metastore, datastore, and search
      "repositories": {
        "dkan_query_tools_local": {
          "type": "path",
-         "url": "./web/modules/custom/dkan_query_tools",
+         "url": "./docroot/modules/custom/dkan_query_tools",
          "options": { "symlink": true }
        }
      },
@@ -106,8 +106,14 @@ agent can read and self-correct from. See
 
 ## Tests
 
+Use the module-local PHPUnit runner:
+
 ```bash
-cd web/modules/custom/dkan_query_tools && vendor/bin/phpunit
+cd docroot/modules/custom/dkan_query_tools && vendor/bin/phpunit
 ```
 
-86 unit tests using standalone stubs in `tests/stubs/` (no Drupal bootstrap).
+Unit tests use standalone stubs in `tests/stubs/` (no Drupal bootstrap). The
+test bootstrap registers only this module's PSR-4 namespaces — it does not load
+the module's `vendor/autoload.php` — so the suite also runs under the site-level
+PHPUnit binary (`../../../../vendor/bin/phpunit`) without mixing PHPUnit major
+versions.

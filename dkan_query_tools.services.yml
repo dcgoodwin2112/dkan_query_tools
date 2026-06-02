@@ -18,6 +18,7 @@ services:
       - '@dkan.common.dataset_info'
       - '@database'
       - '@dkan_query_tools.logger_channel'
+      - '@dkan.datastore.import_info'
 
   dkan_query_tools.search:
     class: Drupal\dkan_query_tools\Tool\SearchTools

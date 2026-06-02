@@ -8,6 +8,7 @@ use Drupal\Core\Database\Connection;
 use Drupal\Core\Database\StatementInterface;
 use Drupal\Core\Database\Query\SelectInterface;
 use Drupal\dkan_datastore\DatastoreService;
+use Drupal\dkan_datastore\Service\Info\ImportInfo;
 use Drupal\dkan_datastore\Service\Query;
 use Drupal\dkan_query_tools\Tool\DatastoreTools;
 use Drupal\dkan_metastore\MetastoreService;
@@ -23,13 +24,27 @@ class DatastoreToolsTest extends TestCase {
     ?MetastoreService $metastore = NULL,
     ?DatasetInfo $datasetInfo = NULL,
     ?Connection $database = NULL,
+    ?ImportInfo $importInfo = NULL,
   ): DatastoreTools {
     $datastore = $datastore ?? $this->createMock(DatastoreService::class);
     $query = $query ?? $this->createMock(Query::class);
     $metastore = $metastore ?? $this->createMock(MetastoreService::class);
     $datasetInfo = $datasetInfo ?? $this->createMock(DatasetInfo::class);
     $database = $database ?? $this->createMock(Connection::class);
-    return new DatastoreTools($datastore, $query, $metastore, $datasetInfo, $database, new NullLogger());
+    return new DatastoreTools($datastore, $query, $metastore, $datasetInfo, $database, new NullLogger(), $importInfo);
+  }
+
+  /**
+   * Build an ImportInfo mock whose getItem returns the given stage statuses.
+   */
+  private function importInfoReturning(string $importerStatus, string $fileFetcherStatus = 'done', ?string $importerError = NULL): ImportInfo {
+    $importInfo = $this->createMock(ImportInfo::class);
+    $importInfo->method('getItem')->willReturn((object) [
+      'fileFetcherStatus' => $fileFetcherStatus,
+      'importerStatus' => $importerStatus,
+      'importerError' => $importerError,
+    ]);
+    return $importInfo;
   }
 
   public function testQueryDatastoreBasic(): void {
@@ -1304,6 +1319,126 @@ class DatastoreToolsTest extends TestCase {
     $this->assertEquals('nonexistent__123', $result['resource_id']);
     $this->assertEquals('not_imported', $result['status']);
     $this->assertArrayHasKey('error', $result);
+  }
+
+  public function testGetImportStatusZeroRowsReportsDone(): void {
+    // A header-only CSV imports to a valid table with zero data rows. It must
+    // report 'done' (table exists), not 'pending' forever.
+    $summary = (object) ['numOfRows' => 0, 'numOfColumns' => 5];
+    $datastore = $this->createMock(DatastoreService::class);
+    $datastore->method('summary')->willReturn($summary);
+
+    $tools = $this->createTools(datastore: $datastore);
+    $result = $tools->getImportStatus('headeronly__1');
+
+    $this->assertSame('done', $result['status']);
+    $this->assertSame(0, $result['num_of_rows']);
+    $this->assertSame(5, $result['num_of_columns']);
+  }
+
+  public function testQueryDatastoreClampsNegativeOffset(): void {
+    $captured = NULL;
+    $queryService = $this->createMock(Query::class);
+    $queryService->method('runQuery')->willReturnCallback(function ($q) use (&$captured) {
+      $captured = (string) $q;
+      return new RootedJsonData('{"results":[],"count":0}');
+    });
+
+    $tools = $this->createTools(query: $queryService);
+    $tools->queryDatastore('test__1', offset: -5);
+
+    $decoded = json_decode($captured, TRUE);
+    $this->assertSame(0, $decoded['offset'] ?? 0);
+  }
+
+  public function testSearchColumnsClampsNonPositiveLimit(): void {
+    [$datasets, $gatherResults, $schemas] = array_values($this->getSearchColumnsFixtures());
+    $tools = $this->createSearchColumnsTools($datasets, $gatherResults, $schemas);
+
+    // limit <= 0 must clamp to 1, not break on the first match with a >= 0
+    // comparison; the call still returns a well-formed result with matches.
+    $result = $tools->searchColumns('a', 'name', 0);
+
+    $this->assertArrayNotHasKey('error', $result);
+    $this->assertArrayHasKey('matches', $result);
+    $this->assertLessThanOrEqual(1, count($result['matches']));
+  }
+
+  public function testGetImportStatusQueuedDeferredImportReportsPending(): void {
+    // A deferred import: file fetched (localized), datastore import queued, no
+    // table yet, importer still WAITING. Must be 'pending', not 'not_imported'.
+    $datastore = $this->createMock(DatastoreService::class);
+    $datastore->method('summary')->willThrowException(new \Exception('No datastore storage found'));
+
+    $tools = $this->createTools(
+      datastore: $datastore,
+      importInfo: $this->importInfoReturning('waiting', 'done'),
+    );
+    $result = $tools->getImportStatus('queued__1');
+
+    $this->assertSame('pending', $result['status']);
+  }
+
+  public function testGetImportStatusQueuedReimportDoesNotMaskAsDone(): void {
+    // A re-import queued over an older table: importer WAITING, fetcher done,
+    // a stale table exists. Must report 'pending', not 'done'.
+    $summary = (object) ['numOfRows' => 10, 'numOfColumns' => 3];
+    $datastore = $this->createMock(DatastoreService::class);
+    $datastore->method('summary')->willReturn($summary);
+
+    $tools = $this->createTools(
+      datastore: $datastore,
+      importInfo: $this->importInfoReturning('waiting', 'done'),
+    );
+    $result = $tools->getImportStatus('reimport__1');
+
+    $this->assertSame('pending', $result['status']);
+  }
+
+  public function testGetImportStatusViaImportInfoZeroRowsReportsDone(): void {
+    // Production branch (ImportInfo present): a completed zero-row import is
+    // 'done' on the importer's authoritative DONE state.
+    $summary = (object) ['numOfRows' => 0, 'numOfColumns' => 5];
+    $datastore = $this->createMock(DatastoreService::class);
+    $datastore->method('summary')->willReturn($summary);
+
+    $tools = $this->createTools(
+      datastore: $datastore,
+      importInfo: $this->importInfoReturning('done'),
+    );
+    $result = $tools->getImportStatus('headeronly__1');
+
+    $this->assertSame('done', $result['status']);
+    $this->assertSame(0, $result['num_of_rows']);
+  }
+
+  public function testGetImportStatusViaImportInfoErrorReportsError(): void {
+    $datastore = $this->createMock(DatastoreService::class);
+    $datastore->method('summary')->willThrowException(new \Exception('No datastore storage found'));
+
+    $tools = $this->createTools(
+      datastore: $datastore,
+      importInfo: $this->importInfoReturning('error', 'done', 'chunk 3 failed'),
+    );
+    $result = $tools->getImportStatus('broken__1');
+
+    $this->assertSame('error', $result['status']);
+    $this->assertStringContainsString('chunk 3 failed', $result['error']);
+  }
+
+  public function testGetImportStatusNeverImportedViaImportInfoReportsNotImported(): void {
+    // Neither stage started (fetcher + importer WAITING) and no table: the
+    // resource is genuinely un-queued.
+    $datastore = $this->createMock(DatastoreService::class);
+    $datastore->method('summary')->willThrowException(new \Exception('No datastore storage found'));
+
+    $tools = $this->createTools(
+      datastore: $datastore,
+      importInfo: $this->importInfoReturning('waiting', 'waiting'),
+    );
+    $result = $tools->getImportStatus('untouched__1');
+
+    $this->assertSame('not_imported', $result['status']);
   }
 
   /**
