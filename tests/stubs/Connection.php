@@ -24,6 +24,10 @@ abstract class Connection {
         return $this;
       }
 
+      public function isNotNull(string $field): SelectInterface {
+        return $this;
+      }
+
       public function range(?int $start = NULL, ?int $length = NULL): SelectInterface {
         return $this;
       }
@@ -71,6 +75,11 @@ abstract class Connection {
 
   public function schema(): Schema {
     return new Schema();
+  }
+
+  public function escapeField(string $field): string {
+    $escaped = preg_replace('/[^A-Za-z0-9_.]+/', '', $field);
+    return '`' . str_replace('.', '`.`', $escaped) . '`';
   }
 
 }

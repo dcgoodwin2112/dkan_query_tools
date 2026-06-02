@@ -2,21 +2,30 @@
 
 namespace Drupal\dkan_query_tools\Tool;
 
-use GuzzleHttp\ClientInterface;
-use Symfony\Component\HttpFoundation\RequestStack;
-
 /**
  * Tools for DKAN catalog search operations.
  */
 class SearchTools {
 
+  /**
+   * @param \Closure $searchFactory
+   *   Lazy factory returning the dkan.metastore_search.service. Injected as a
+   *   service closure so the search service (which loads the 'dkan' search
+   *   index on construction) is only built when a search actually runs, not at
+   *   container-build / tool-instantiation time.
+   */
   public function __construct(
-    protected ClientInterface $httpClient,
-    protected RequestStack $requestStack,
+    protected \Closure $searchFactory,
   ) {}
 
   /**
-   * Search datasets by keyword via the DKAN search API.
+   * Search datasets by keyword via the DKAN search service.
+   *
+   * Calls the metastore search service in-process rather than issuing an HTTP
+   * request to the site's own /api/1/search endpoint. The in-process call avoids
+   * a self-directed round trip and, critically, never derives an outbound URL
+   * from the request Host header (which would be a request-controlled SSRF
+   * vector when trusted_host_patterns is unset or permissive).
    *
    * @param string $keyword
    *   Search term.
@@ -29,34 +38,30 @@ class SearchTools {
     $pageSize = min(max($pageSize, 1), 50);
     $page = max($page, 1);
 
-    $baseUrl = $this->getBaseUrl();
-    $url = $baseUrl . '/api/1/search';
-
     try {
-      $response = $this->httpClient->request('GET', $url, [
-        'query' => [
-          'fulltext' => $keyword,
-          'page' => $page,
-          'page-size' => $pageSize,
-        ],
-        'timeout' => 10,
+      $search = ($this->searchFactory)();
+      $response = $search->search([
+        'fulltext' => $keyword,
+        'page' => $page,
+        'page-size' => $pageSize,
       ]);
 
-      $data = json_decode((string) $response->getBody(), TRUE);
-
       $results = [];
-      foreach ($data['results'] ?? [] as $dataset) {
+      foreach ($this->responseValue($response, 'results', []) as $dataset) {
+        $data = (array) $dataset;
         $results[] = [
-          'identifier' => $dataset['identifier'] ?? NULL,
-          'title' => $dataset['title'] ?? NULL,
-          'description' => isset($dataset['description']) ? mb_substr($dataset['description'], 0, 200) : NULL,
-          'distributions' => isset($dataset['distribution']) ? count($dataset['distribution']) : 0,
+          'identifier' => $data['identifier'] ?? NULL,
+          'title' => $data['title'] ?? NULL,
+          'description' => isset($data['description']) && is_scalar($data['description'])
+            ? mb_substr((string) $data['description'], 0, 200)
+            : NULL,
+          'distributions' => isset($data['distribution']) ? count((array) $data['distribution']) : 0,
         ];
       }
 
       return [
         'results' => $results,
-        'total' => (int) ($data['total'] ?? 0),
+        'total' => (int) $this->responseValue($response, 'total', 0),
         'page' => $page,
         'page_size' => $pageSize,
       ];
@@ -67,21 +72,16 @@ class SearchTools {
   }
 
   /**
-   * Get the base URL for API requests.
+   * Read a key from the search response, which may be an object or an array.
    */
-  protected function getBaseUrl(): string {
-    $request = $this->requestStack->getCurrentRequest();
-    if ($request) {
-      return $request->getSchemeAndHttpHost();
+  private function responseValue(mixed $response, string $key, mixed $default): mixed {
+    if (is_object($response)) {
+      return $response->{$key} ?? $default;
     }
-
-    // Drush context: use DRUSH_OPTIONS_URI or fallback.
-    $uri = getenv('DRUSH_OPTIONS_URI');
-    if ($uri) {
-      return rtrim($uri, '/');
+    if (is_array($response)) {
+      return $response[$key] ?? $default;
     }
-
-    return 'http://localhost';
+    return $default;
   }
 
 }

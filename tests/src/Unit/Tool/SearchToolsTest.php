@@ -2,47 +2,39 @@
 
 namespace Drupal\Tests\dkan_query_tools\Unit\Tool;
 
+use Drupal\dkan_metastore_search\Search;
 use Drupal\dkan_query_tools\Tool\SearchTools;
-use GuzzleHttp\ClientInterface;
-use GuzzleHttp\Exception\RequestException;
-use GuzzleHttp\Psr7\Request;
-use GuzzleHttp\Psr7\Response;
 use PHPUnit\Framework\TestCase;
-use Symfony\Component\HttpFoundation\RequestStack;
-use Symfony\Component\HttpFoundation\Request as SymfonyRequest;
 
 class SearchToolsTest extends TestCase {
 
-  protected function createTools(ClientInterface $client, ?SymfonyRequest $request = NULL): SearchTools {
-    $requestStack = $this->createMock(RequestStack::class);
-    $requestStack->method('getCurrentRequest')->willReturn($request);
-    return new SearchTools($client, $requestStack);
+  protected function createTools(Search $search): SearchTools {
+    return new SearchTools(fn() => $search);
   }
 
   public function testSearchDatasetsSuccess(): void {
     $longDesc = str_repeat('A', 300);
-    $body = json_encode([
+    $response = (object) [
       'results' => [
-        [
+        (object) [
           'identifier' => 'abc-123',
           'title' => 'Test Dataset',
           'description' => $longDesc,
           'distribution' => [
-            ['downloadURL' => 'http://example.com/a.csv'],
-            ['downloadURL' => 'http://example.com/b.csv'],
+            (object) ['downloadURL' => 'http://example.com/a.csv'],
+            (object) ['downloadURL' => 'http://example.com/b.csv'],
           ],
           'keyword' => ['test', 'data'],
           '%Ref:distribution' => ['extra' => 'data'],
         ],
       ],
       'total' => 1,
-    ]);
+    ];
 
-    $client = $this->createMock(ClientInterface::class);
-    $client->method('request')->willReturn(new Response(200, [], $body));
+    $search = $this->createMock(Search::class);
+    $search->method('search')->willReturn($response);
 
-    $request = SymfonyRequest::create('http://example.com');
-    $tools = $this->createTools($client, $request);
+    $tools = $this->createTools($search);
     $result = $tools->searchDatasets('test');
 
     $this->assertCount(1, $result['results']);
@@ -61,87 +53,58 @@ class SearchToolsTest extends TestCase {
   }
 
   public function testSearchDatasetsTotalCastToInt(): void {
-    $body = json_encode([
-      'results' => [],
-      'total' => '42',
-    ]);
+    $search = $this->createMock(Search::class);
+    $search->method('search')->willReturn((object) ['results' => [], 'total' => '42']);
 
-    $client = $this->createMock(ClientInterface::class);
-    $client->method('request')->willReturn(new Response(200, [], $body));
-
-    $request = SymfonyRequest::create('http://example.com');
-    $tools = $this->createTools($client, $request);
+    $tools = $this->createTools($search);
     $result = $tools->searchDatasets('test');
 
     $this->assertSame(42, $result['total']);
   }
 
-  public function testSearchDatasetsHttpError(): void {
-    $client = $this->createMock(ClientInterface::class);
-    $client->method('request')->willThrowException(
-      new RequestException('Connection failed', new Request('GET', '/api/1/search'))
-    );
+  public function testSearchDatasetsServiceError(): void {
+    $search = $this->createMock(Search::class);
+    $search->method('search')->willThrowException(new \RuntimeException('index unavailable'));
 
-    $request = SymfonyRequest::create('http://example.com');
-    $tools = $this->createTools($client, $request);
+    $tools = $this->createTools($search);
     $result = $tools->searchDatasets('test');
 
     $this->assertArrayHasKey('error', $result);
-    $this->assertStringContainsString('Connection failed', $result['error']);
+    $this->assertStringContainsString('index unavailable', $result['error']);
   }
 
-  public function testSearchDatasetsPageSizeClamping(): void {
-    $body = json_encode(['results' => [], 'total' => 0]);
+  public function testSearchDatasetsClampsAndForwardsParams(): void {
+    $search = $this->createMock(Search::class);
+    $search->expects($this->once())
+      ->method('search')
+      ->with($this->callback(function ($params) {
+        return $params['fulltext'] === 'test'
+          && $params['page-size'] === 50
+          && $params['page'] === 1;
+      }))
+      ->willReturn((object) ['results' => [], 'total' => 0]);
 
-    $client = $this->createMock(ClientInterface::class);
-    $client->expects($this->once())
-      ->method('request')
-      ->with(
-        'GET',
-        $this->anything(),
-        $this->callback(function ($options) {
-          return $options['query']['page-size'] === 50
-            && $options['query']['page'] === 1;
-        })
-      )
-      ->willReturn(new Response(200, [], $body));
-
-    $request = SymfonyRequest::create('http://example.com');
-    $tools = $this->createTools($client, $request);
+    $tools = $this->createTools($search);
     $result = $tools->searchDatasets('test', 0, 200);
 
     $this->assertEquals(1, $result['page']);
     $this->assertEquals(50, $result['page_size']);
   }
 
-  public function testSearchDatasetsDrushFallbackUrl(): void {
-    $body = json_encode(['results' => [], 'total' => 0]);
+  public function testSearchDatasetsHandlesArrayResponse(): void {
+    // The service contract returns an object, but tolerate an array shape too.
+    $search = $this->createMock(Search::class);
+    $search->method('search')->willReturn([
+      'results' => [['identifier' => 'x-1', 'title' => 'X']],
+      'total' => 1,
+    ]);
 
-    $client = $this->createMock(ClientInterface::class);
-    $client->expects($this->once())
-      ->method('request')
-      ->with(
-        'GET',
-        $this->stringContains('http://localhost/api/1/search'),
-        $this->anything(),
-      )
-      ->willReturn(new Response(200, [], $body));
+    $tools = $this->createTools($search);
+    $result = $tools->searchDatasets('x');
 
-    // No Symfony request (Drush context), no DRUSH_OPTIONS_URI.
-    // DDEV's container env exports DRUSH_OPTIONS_URI; isolate the test.
-    $previousUri = getenv('DRUSH_OPTIONS_URI');
-    putenv('DRUSH_OPTIONS_URI');
-    try {
-      $tools = $this->createTools($client);
-      $result = $tools->searchDatasets('test');
-    }
-    finally {
-      if ($previousUri !== FALSE) {
-        putenv('DRUSH_OPTIONS_URI=' . $previousUri);
-      }
-    }
-
-    $this->assertArrayHasKey('results', $result);
+    $this->assertSame(1, $result['total']);
+    $this->assertSame('x-1', $result['results'][0]['identifier']);
+    $this->assertSame(0, $result['results'][0]['distributions']);
   }
 
 }
